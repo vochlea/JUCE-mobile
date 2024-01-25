@@ -476,8 +476,8 @@ struct iOSAudioIODevice::Pimpl      : public AsyncUpdater
                             << ", targetBufferSize: " << targetBufferSize);
 
         setAudioSessionActive (true);
-        setAudioSessionCategory (requestedInputChannels > 0 ? AVAudioSessionCategoryPlayAndRecord
-                                                            : AVAudioSessionCategoryPlayback);
+        // setAudioSessionCategory (requestedInputChannels > 0 ? AVAudioSessionCategoryPlayAndRecord
+        //                                                     : AVAudioSessionCategoryPlayback);
         channelData.reconfigure (requestedInputChannels, requestedOutputChannels);
         updateHardwareInfo (true);
         setTargetSampleRateAndBufferSize();
