@@ -65,6 +65,8 @@ public:
         kAmr,
     };
 
+    CoreAudioFormat (StreamKind);
+    
     /** Destructor. */
     ~CoreAudioFormat() override;
 
@@ -100,7 +102,6 @@ public:
     using AudioFormat::createWriterFor;
 
 private:
-    CoreAudioFormat (StreamKind);
 
     StreamKind streamKind;
 
