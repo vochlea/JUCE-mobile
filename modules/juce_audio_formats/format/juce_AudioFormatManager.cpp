@@ -65,7 +65,7 @@ void AudioFormatManager::registerBasicFormats()
    #endif
 
    #if JUCE_MAC || JUCE_IOS
-    registerFormat (new CoreAudioFormat(), false);
+    CoreAudioFormat::registerFormats (*this);
    #endif
 
    #if JUCE_USE_MP3AUDIOFORMAT
