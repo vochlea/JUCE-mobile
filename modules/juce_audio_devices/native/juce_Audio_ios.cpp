@@ -471,6 +471,7 @@ struct iOSAudioIODevice::Pimpl final : public AsyncUpdater
                             << ", targetBufferSize: " << targetBufferSize);
 
         setAudioSessionActive (true);
+        // This is a quick fix to prevent the play taking a long time in our mobile app, this will break JUCE's standard behaviour but we don't use it for anything else
         // setAudioSessionCategory (requestedInputChannels > 0 ? AVAudioSessionCategoryPlayAndRecord
         //                                                     : AVAudioSessionCategoryPlayback);
         channelData.reconfigure (requestedInputChannels, requestedOutputChannels);
