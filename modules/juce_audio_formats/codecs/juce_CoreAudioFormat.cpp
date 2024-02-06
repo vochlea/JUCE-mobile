@@ -65,7 +65,7 @@ namespace
         return getStringInfo (kAudioFileGlobalInfo_ExtensionsForType, sizeof (AudioFileTypeID), &type);
     }
 
-    StringArray findFileExtensionsForCoreAudioCodecs()
+    StringArray findFileExtensionsForCoreAudioCodecs [[maybe_unused]]()
     {
         return getStringInfo (kAudioFileGlobalInfo_AllExtensions, 0, nullptr);
     }
@@ -609,16 +609,182 @@ private:
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (CoreAudioReader)
 };
 
-//==============================================================================
-CoreAudioFormat::CoreAudioFormat()
-    : AudioFormat (coreAudioFormatName, findFileExtensionsForCoreAudioCodecs()),
-      streamKind (StreamKind::kNone)
+static AudioFormatID formatForFileType (AudioFileTypeID fileType)
 {
+    AudioFormatID formatIds[10];
+    UInt32 sizeOfArray = sizeof (formatIds);
+    AudioFileGetGlobalInfo (
+        kAudioFileGlobalInfo_AvailableFormatIDs, sizeof (fileType), (void*) &fileType, &sizeOfArray, &formatIds);
+    jassert (sizeOfArray != 0);
+    return formatIds[0];
 }
 
+static void fillAudioStreamBasicDescription (AudioStreamBasicDescription* fmt)
+{
+    UInt32 sz = sizeof (AudioStreamBasicDescription);
+    OSStatus e [[maybe_unused]] = AudioFormatGetProperty (kAudioFormatProperty_FormatInfo, 0, nullptr, &sz, fmt);
+    jassertquiet (e == noErr);
+}
+
+class CoreAudioWriter : public AudioFormatWriter
+{
+public:
+    CoreAudioWriter (
+        OutputStream* out, AudioFileTypeID fileType, double sr, unsigned int numberOfChannels, unsigned int bitsPerSamp)
+    : AudioFormatWriter (out, coreAudioFormatName, sr, numberOfChannels, bitsPerSamp)
+    {
+        usesFloatingPointData = true;
+        {
+            AudioStreamBasicDescription fmt;
+            memset (&fmt, 0, sizeof (fmt));
+            fmt.mSampleRate = sr;
+            fmt.mChannelsPerFrame = numberOfChannels;
+            fmt.mFormatID = formatForFileType (fileType);
+            OSStatus e [[maybe_unused]] = AudioFileInitializeWithCallbacks (
+                this,
+                &readCallback,
+                &writeCallback,
+                &getSizeCallback,
+                &setSizeCallback,
+                fileType,
+                &fmt,
+                0,
+                &audioFileID);
+            jassertquiet (e == noErr);
+        }
+        ExtAudioFileWrapAudioFileID (audioFileID, true, &audioFileRef);
+        {
+            AudioStreamBasicDescription fmt;
+            memset (&fmt, 0, sizeof (fmt));
+            fmt.mSampleRate = sr;
+            fmt.mChannelsPerFrame = numberOfChannels;
+            fmt.mFormatID = kAudioFormatLinearPCM;
+            fmt.mFormatFlags =
+                kLinearPCMFormatFlagIsFloat | kLinearPCMFormatFlagIsNonInterleaved | kAudioFormatFlagsNativeEndian;
+            fmt.mBitsPerChannel = sizeof (float) * 8;
+            fmt.mBytesPerFrame = sizeof (float);
+            fillAudioStreamBasicDescription (&fmt);
+            OSStatus e [[maybe_unused]] =
+                ExtAudioFileSetProperty (audioFileRef, kExtAudioFileProperty_ClientDataFormat, sizeof (fmt), &fmt);
+            jassertquiet (e == noErr);
+        }
+        bufferList.malloc (1, sizeof (AudioBufferList) + numChannels * sizeof (::AudioBuffer));
+        bufferList->mNumberBuffers = numChannels;
+        srcPos = 0;
+    }
+
+    ~CoreAudioWriter() override
+    {
+        ExtAudioFileDispose (audioFileRef);
+        AudioFileClose (audioFileID);
+    }
+
+    bool write (const int** samplesToWrite, int numSamples) override
+    {
+        for (int j = (int) numChannels; --j >= 0;)
+        {
+            bufferList->mBuffers[j].mNumberChannels = 1;
+            bufferList->mBuffers[j].mDataByteSize = (UInt32) numSamples * sizeof (float);
+            bufferList->mBuffers[j].mData = (void*) samplesToWrite[j];
+        }
+        return ExtAudioFileWrite (audioFileRef, (UInt32) numSamples, bufferList) == noErr;
+    }
+
+    bool flush() override
+    {
+        output->flush();
+        return true;
+    }
+
+    SInt64 size = 0;
+
+private:
+    AudioFileID audioFileID;
+    ExtAudioFileRef audioFileRef;
+    HeapBlock<AudioBufferList> bufferList;
+    SInt64 srcPos;
+
+    static OSStatus writeCallback (
+        void* inClientData, SInt64 inPosition, UInt32 requestCount, const void* buffer, UInt32* actualCount)
+    {
+        auto* self = static_cast<CoreAudioWriter*> (inClientData);
+        self->output->setPosition (inPosition);
+        if (! self->output->write (buffer, requestCount))
+        {
+            jassertfalse;
+            return -1;
+        }
+        *actualCount = requestCount;
+        self->size += requestCount;
+        return noErr;
+    }
+
+    static OSStatus
+    readCallback (void* inClientData, SInt64 inPosition, UInt32 requestCount, void* buffer, UInt32* actualCount)
+    {
+        auto* self = static_cast<CoreAudioWriter*> (inClientData);
+
+        // For formats that require the read callback,
+        // CoreAudioWriter supports it for specific output stream types: FileOutputStream and MemoryOutputStream.
+        // These are the built-in JUCE output streams that conceptually support reading.
+        // A more robust solution would have been if JUCE OutputStreams had the option (not implemented by all) to also
+        // support reads.
+
+        auto* file = dynamic_cast<FileOutputStream*> (self->output);
+        if (file != nullptr)
+        {
+            FileInputStream in (file->getFile());
+            jassert (in.openedOk());
+            {
+                bool setPositionOK [[maybe_unused]] = in.setPosition (inPosition);
+                jassertquiet (setPositionOK);
+            }
+            *actualCount = (UInt32) in.read (buffer, (int) requestCount);
+            return noErr;
+        }
+
+        auto* mem = dynamic_cast<MemoryOutputStream*> (self->output);
+        if (mem != nullptr)
+        {
+            const int remain = jmax (0, (int) mem->getDataSize() - (int) inPosition);
+            const size_t count = (size_t) jmin (requestCount, (UInt32) remain);
+            *actualCount = (UInt32) count;
+            memcpy (buffer, (char*) mem->getData() + inPosition, count);
+            return noErr;
+        }
+
+        return -1;
+    }
+    static SInt64 getSizeCallback (void* inClientData)
+    {
+        auto* self = static_cast<CoreAudioWriter*> (inClientData);
+        return self->size;
+    }
+    static OSStatus setSizeCallback (void* inClientData, SInt64 size)
+    {
+        auto* self = static_cast<CoreAudioWriter*> (inClientData);
+        if (self->size == size)
+            return noErr;
+
+        if (auto* out = dynamic_cast<FileOutputStream*> (self->output))
+        {
+            bool setPositionOK [[maybe_unused]] = out->setPosition (size);
+            jassertquiet (setPositionOK);
+            Result truncatedOK [[maybe_unused]] = out->truncate();
+            jassertquiet (truncatedOK);
+        }
+        return noErr;
+    }
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (CoreAudioWriter)
+};
+
+//==============================================================================
 CoreAudioFormat::CoreAudioFormat (StreamKind kind)
-    : AudioFormat (coreAudioFormatName, findFileExtensionsForCoreAudioCodec (toAudioFileTypeID (kind))),
-      streamKind (kind)
+: AudioFormat (
+    String (coreAudioFormatName) + " " + String ((int) kind),
+    findFileExtensionsForCoreAudioCodec (toAudioFileTypeID (kind)))
+, streamKind (kind)
 {
 }
 
@@ -645,17 +811,22 @@ AudioFormatReader* CoreAudioFormat::createReaderFor (InputStream* sourceStream,
     return nullptr;
 }
 
-AudioFormatWriter* CoreAudioFormat::createWriterFor (OutputStream*,
-                                                     double /*sampleRateToUse*/,
-                                                     unsigned int /*numberOfChannels*/,
-                                                     int /*bitsPerSample*/,
-                                                     const StringPairArray& /*metadataValues*/,
-                                                     int /*qualityOptionIndex*/)
+AudioFormatWriter* CoreAudioFormat::createWriterFor (
+    OutputStream* output,
+    double sampleRateToUse,
+    unsigned int numberOfChannels,
+    int bitsPerSample,
+    const StringPairArray& /*metadataValues*/,
+    int /*qualityOptionIndex*/)
 {
-    jassertfalse; // not yet implemented!
-    return nullptr;
+    return new CoreAudioWriter (output, toAudioFileTypeID (streamKind), sampleRateToUse, numberOfChannels, (unsigned int) bitsPerSample);
 }
 
+void CoreAudioFormat::registerFormats (AudioFormatManager& formats)
+{
+    for (int k = (int) StreamKind::kAiff; k <= (int) StreamKind::kAmr; ++k)
+        formats.registerFormat (new CoreAudioFormat ((StreamKind) k), false);
+}
 
 //==============================================================================
 //==============================================================================

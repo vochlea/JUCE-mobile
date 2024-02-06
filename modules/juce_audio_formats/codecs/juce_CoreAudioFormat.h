@@ -65,17 +65,12 @@ public:
         kAmr,
     };
 
-    //==============================================================================
-    /** Creates a format object. */
-    CoreAudioFormat();
-
-    /** Creates a format object and provides a hint as to the format of data
-        to be read or written.
-    */
-    explicit CoreAudioFormat (StreamKind);
-
+    CoreAudioFormat (StreamKind);
+    
     /** Destructor. */
     ~CoreAudioFormat() override;
+
+    static void registerFormats (AudioFormatManager&);
 
     //==============================================================================
     /** Metadata property name used when reading a caf file with a MIDI chunk. */
@@ -97,6 +92,7 @@ public:
     AudioFormatReader* createReaderFor (InputStream*,
                                         bool deleteStreamIfOpeningFails) override;
 
+    // Note: For some formats the output streams needs to be a FileOutputStreams
     AudioFormatWriter* createWriterFor (OutputStream*,
                                         double sampleRateToUse,
                                         unsigned int numberOfChannels,
@@ -106,7 +102,8 @@ public:
     using AudioFormat::createWriterFor;
 
 private:
-    StreamKind streamKind = StreamKind::kNone;
+
+    StreamKind streamKind;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (CoreAudioFormat)
 };
