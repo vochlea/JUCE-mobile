@@ -476,6 +476,7 @@ struct iOSAudioIODevice::Pimpl      : public AsyncUpdater
                             << ", targetBufferSize: " << targetBufferSize);
 
         setAudioSessionActive (true);
+        // VOCHLEA - we have removed this because it adds lots of delay on mobile when it changes...
         // setAudioSessionCategory (requestedInputChannels > 0 ? AVAudioSessionCategoryPlayAndRecord
         //                                                     : AVAudioSessionCategoryPlayback);
         channelData.reconfigure (requestedInputChannels, requestedOutputChannels);
