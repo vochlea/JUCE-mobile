@@ -383,229 +383,142 @@ struct CoreAudioFormatMetatdata
     }
 };
 
-//==============================================================================
-class CoreAudioReader : public AudioFormatReader
+class CoreAudioReader : public juce::AudioFormatReader
 {
 public:
-    using StreamKind = CoreAudioFormat::StreamKind;
+    using StreamKind = juce::CoreAudioFormat::StreamKind;
 
-    CoreAudioReader (InputStream* inp, StreamKind streamKind)
-        : AudioFormatReader (inp, coreAudioFormatName)
+    CoreAudioReader(juce::InputStream* sourceStream, StreamKind streamKind)
+    : AudioFormatReader(sourceStream, coreAudioFormatName), audioFile(nil)
     {
-        usesFloatingPointData = true;
-        bitsPerSample = 32;
+        // Convert to FileInputStream and get the path
+        auto fileSourceStream = dynamic_cast<juce::FileInputStream*>(sourceStream);
 
-        if (input != nullptr)
-            CoreAudioFormatMetatdata::read (*input, metadataValues);
-
-        auto status = AudioFileOpenWithCallbacks (this,
-                                                  &readCallback,
-                                                  nullptr,  // write needs to be null to avoid permissions errors
-                                                  &getSizeCallback,
-                                                  nullptr,  // setSize needs to be null to avoid permissions errors
-                                                  toAudioFileTypeID (streamKind),
-                                                  &audioFileID);
-        if (status == noErr)
-        {
-            status = ExtAudioFileWrapAudioFileID (audioFileID, false, &audioFileRef);
-
-            if (status == noErr)
-            {
-                AudioStreamBasicDescription sourceAudioFormat;
-                UInt32 audioStreamBasicDescriptionSize = sizeof (AudioStreamBasicDescription);
-                ExtAudioFileGetProperty (audioFileRef,
-                                         kExtAudioFileProperty_FileDataFormat,
-                                         &audioStreamBasicDescriptionSize,
-                                         &sourceAudioFormat);
-
-                numChannels = sourceAudioFormat.mChannelsPerFrame;
-                sampleRate  = sourceAudioFormat.mSampleRate;
-
-                UInt32 sizeOfLengthProperty = sizeof (int64);
-                ExtAudioFileGetProperty (audioFileRef,
-                                         kExtAudioFileProperty_FileLengthFrames,
-                                         &sizeOfLengthProperty,
-                                         &lengthInSamples);
-
-                HeapBlock<AudioChannelLayout> caLayout;
-                bool hasLayout = false;
-                UInt32 sizeOfLayout = 0, isWritable = 0;
-
-                status = AudioFileGetPropertyInfo (audioFileID, kAudioFilePropertyChannelLayout, &sizeOfLayout, &isWritable);
-
-                if (status == noErr && sizeOfLayout >= (sizeof (AudioChannelLayout) - sizeof (AudioChannelDescription)))
-                {
-                    caLayout.malloc (1, static_cast<size_t> (sizeOfLayout));
-
-                    status = AudioFileGetProperty (audioFileID, kAudioFilePropertyChannelLayout,
-                                                   &sizeOfLayout, caLayout.get());
-
-                    if (status == noErr)
-                    {
-                        auto fileLayout = CoreAudioLayouts::fromCoreAudio (*caLayout.get());
-
-                        if (fileLayout.size() == static_cast<int> (numChannels))
-                        {
-                            hasLayout = true;
-                            channelSet = fileLayout;
-                        }
-                    }
-                }
-
-                destinationAudioFormat.mSampleRate       = sampleRate;
-                destinationAudioFormat.mFormatID         = kAudioFormatLinearPCM;
-                destinationAudioFormat.mFormatFlags      = kLinearPCMFormatFlagIsFloat | kLinearPCMFormatFlagIsNonInterleaved | kAudioFormatFlagsNativeEndian;
-                destinationAudioFormat.mBitsPerChannel   = sizeof (float) * 8;
-                destinationAudioFormat.mChannelsPerFrame = numChannels;
-                destinationAudioFormat.mBytesPerFrame    = sizeof (float);
-                destinationAudioFormat.mFramesPerPacket  = 1;
-                destinationAudioFormat.mBytesPerPacket   = destinationAudioFormat.mFramesPerPacket * destinationAudioFormat.mBytesPerFrame;
-
-                status = ExtAudioFileSetProperty (audioFileRef,
-                                                  kExtAudioFileProperty_ClientDataFormat,
-                                                  sizeof (AudioStreamBasicDescription),
-                                                  &destinationAudioFormat);
-                if (status == noErr)
-                {
-                    bufferList.malloc (1, sizeof (AudioBufferList) + numChannels * sizeof (::AudioBuffer));
-                    bufferList->mNumberBuffers = numChannels;
-                    channelMap.malloc (numChannels);
-
-                    if (hasLayout && caLayout != nullptr)
-                    {
-                        auto caOrder = CoreAudioLayouts::getCoreAudioLayoutChannels (*caLayout);
-
-                        for (int i = 0; i < static_cast<int> (numChannels); ++i)
-                        {
-                            auto idx = channelSet.getChannelIndexForType (caOrder.getReference (i));
-                            jassert (isPositiveAndBelow (idx, static_cast<int> (numChannels)));
-
-                            channelMap[i] = idx;
-                        }
-                    }
-                    else
-                    {
-                        for (int i = 0; i < static_cast<int> (numChannels); ++i)
-                            channelMap[i] = i;
-                    }
-
-                    ok = true;
-                }
-            }
+        if (fileSourceStream == nullptr) {
+            NSLog(@"Error casting to FileInputStream");
+            return;
         }
+
+        const auto pathName = fileSourceStream->getFile().getFullPathName();
+
+        // Assuming sourceStream points to a valid file path
+        NSString *filePath = [NSString stringWithUTF8String:pathName.toRawUTF8()];
+        NSURL* fileURL = [NSURL fileURLWithPath:filePath];
+
+        NSError* error = nil;
+        audioFile = [[AVAudioFile alloc] initForReading:fileURL commonFormat:AVAudioPCMFormatFloat32 interleaved:NO error:&error];
+        if (error) {
+            NSLog(@"Error opening audio file: %@", error);
+            return;
+        }
+
+        // Get bits per sample from file format
+        bitsPerSample = 32;
+        sampleRate = audioFile.fileFormat.sampleRate;
+        numChannels = audioFile.fileFormat.channelCount;
+        lengthInSamples = (juce::int64)audioFile.length;
+        usesFloatingPointData = true;
+
+        auto channelLayout = audioFile.fileFormat.channelLayout.layout;
+        createChannelMap(channelLayout);
+
+        reusableBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:audioFile.processingFormat frameCapacity:2048];
     }
 
-    ~CoreAudioReader() override
+    ~CoreAudioReader()
     {
-        ExtAudioFileDispose (audioFileRef);
-        AudioFileClose (audioFileID);
     }
 
-    //==============================================================================
     bool readSamples (int* const* destSamples, int numDestChannels, int startOffsetInDestBuffer,
-                      int64 startSampleInFile, int numSamples) override
+                      juce::int64 startSampleInFile, int numSamples) override
     {
         clearSamplesBeyondAvailableLength (destSamples, numDestChannels, startOffsetInDestBuffer,
                                            startSampleInFile, numSamples, lengthInSamples);
 
-        if (numSamples <= 0)
-            return true;
-
-        if (lastReadPosition != startSampleInFile)
-        {
-            OSStatus status = ExtAudioFileSeek (audioFileRef, startSampleInFile);
-            if (status != noErr)
-                return false;
-
-            lastReadPosition = startSampleInFile;
+        if (audioFile == nil) {
+            NSLog(@"Audio file is nil");
+            return false;
         }
 
-        while (numSamples > 0)
+        if (!reusableBuffer ||
+            ![reusableBuffer.format isEqual:audioFile.processingFormat] ||
+            reusableBuffer.frameCapacity < numSamples) {
+            NSLog(@"Creating new reusable buffer");
+            reusableBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:audioFile.processingFormat frameCapacity:numSamples];
+        }
+
+        // Now check if startSampleInFile is the same as the current file position, if not change it
+        if (audioFile.framePosition != startSampleInFile) {
+            audioFile.framePosition = startSampleInFile;
+        }
+
+        NSError* error = nil;
+        [audioFile readIntoBuffer:reusableBuffer frameCount:numSamples error:&error];
+        if (error) {
+            NSLog(@"Error reading audio file: %@", error);
+            return false;
+        }
+
+        auto numBytes = (size_t) numSamples * sizeof (float);
+
+        // Also mostly copied from juce
+        for (int i = numDestChannels; --i >= 0;)
         {
-            auto numThisTime = jmin (8192, numSamples);
-            auto numBytes = (size_t) numThisTime * sizeof (float);
+            auto* dest = destSamples[(i < (int) numChannels ? channelMap[i] : i)];
 
-            audioDataBlock.ensureSize (numBytes * numChannels, false);
-            auto* data = static_cast<float*> (audioDataBlock.getData());
-
-            for (int j = (int) numChannels; --j >= 0;)
+            if (dest != nullptr)
             {
-                bufferList->mBuffers[j].mNumberChannels = 1;
-                bufferList->mBuffers[j].mDataByteSize = (UInt32) numBytes;
-                bufferList->mBuffers[j].mData = data;
-                data += numThisTime;
-            }
-
-            auto numFramesToRead = (UInt32) numThisTime;
-            auto status = ExtAudioFileRead (audioFileRef, &numFramesToRead, bufferList);
-
-            if (status != noErr)
-                return false;
-
-            if (numFramesToRead == 0)
-                break;
-
-            if ((int) numFramesToRead < numThisTime)
-            {
-                numThisTime = (int) numFramesToRead;
-                numBytes    = (size_t) numThisTime * sizeof (float);
-            }
-
-            for (int i = numDestChannels; --i >= 0;)
-            {
-                auto* dest = destSamples[(i < (int) numChannels ? channelMap[i] : i)];
-
-                if (dest != nullptr)
+                if (i < (int) numChannels)
                 {
-                    if (i < (int) numChannels)
-                        memcpy (dest + startOffsetInDestBuffer, bufferList->mBuffers[i].mData, numBytes);
-                    else
-                        zeromem (dest + startOffsetInDestBuffer, numBytes);
+                    memcpy (dest + startOffsetInDestBuffer, reusableBuffer.floatChannelData[i], numBytes);
+                }
+                else
+                {
+                    zeromem (dest + startOffsetInDestBuffer, numBytes);
                 }
             }
-
-            startOffsetInDestBuffer += numThisTime;
-            numSamples -= numThisTime;
-            lastReadPosition += numThisTime;
         }
 
         return true;
     }
-
-    AudioChannelSet getChannelLayout() override
-    {
-        if (channelSet.size() == static_cast<int> (numChannels))
-            return channelSet;
-
-        return AudioFormatReader::getChannelLayout();
-    }
-
-    bool ok = false;
-
+    
 private:
-    AudioFileID audioFileID;
-    ExtAudioFileRef audioFileRef;
+    // Mostly copied from all the existing juce stuff, left relatively untouched (hence why it looks messy)
+    void createChannelMap(AVAudioChannelLayout* channelLayout)
+    {
+        channelMap.malloc(numChannels);
+        if (channelLayout != nullptr)
+        {
+            auto fileLayout = CoreAudioLayouts::fromCoreAudio (*channelLayout);
+
+            if (fileLayout && fileLayout.size() == static_cast<int> (numChannels))
+            {
+                channelSet = fileLayout;
+            }
+            
+            auto caOrder = juce::CoreAudioLayouts::getCoreAudioLayoutChannels (*channelLayout);
+            for (int i = 0; i < static_cast<int> (numChannels); ++i)
+            {
+                auto idx = channelSet.getChannelIndexForType (caOrder.getReference (i));
+                jassert (isPositiveAndBelow (idx, static_cast<int> (numChannels));
+                channelMap[i] = idx;
+            }
+        }
+        else
+        {
+            for (int i = 0; i < static_cast<int> (numChannels); ++i)
+            {
+                channelMap[i] = i;
+            }
+        }
+    }
+    
+private:
+    AVAudioFile* audioFile;
+    AVAudioPCMBuffer* reusableBuffer;
     AudioChannelSet channelSet;
-    AudioStreamBasicDescription destinationAudioFormat;
-    MemoryBlock audioDataBlock;
-    HeapBlock<AudioBufferList> bufferList;
-    int64 lastReadPosition = 0;
     HeapBlock<int> channelMap;
-
-    static SInt64 getSizeCallback (void* inClientData)
-    {
-        return static_cast<CoreAudioReader*> (inClientData)->input->getTotalLength();
-    }
-
-    static OSStatus readCallback (void* inClientData, SInt64 inPosition, UInt32 requestCount,
-                                  void* buffer, UInt32* actualCount)
-    {
-        auto* reader = static_cast<CoreAudioReader*> (inClientData);
-        reader->input->setPosition (inPosition);
-        *actualCount = (UInt32) reader->input->read (buffer, (int) requestCount);
-        return noErr;
-    }
-
+ 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (CoreAudioReader)
 };
 
@@ -802,7 +715,7 @@ AudioFormatReader* CoreAudioFormat::createReaderFor (InputStream* sourceStream,
 {
     std::unique_ptr<CoreAudioReader> r (new CoreAudioReader (sourceStream, streamKind));
 
-    if (r->ok)
+    if (r)
         return r.release();
 
     if (! deleteStreamIfOpeningFails)
