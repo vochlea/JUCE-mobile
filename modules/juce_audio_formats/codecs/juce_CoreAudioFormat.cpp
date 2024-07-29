@@ -28,6 +28,8 @@
 #include <juce_audio_basics/native/juce_CoreAudioLayouts_mac.h>
 #include <juce_core/native/juce_CFHelpers_mac.h>
 
+#import <AVFoundation/AVFoundation.h>
+
 namespace juce
 {
 
@@ -392,9 +394,9 @@ public:
 
     CoreAudioReader(juce::InputStream* sourceStream, StreamKind streamKind) :
         AudioFormatReader(sourceStream, coreAudioFormatName),
+        ok(false),
         audioFile(nullptr),
-        reusableBuffer(nullptr),
-        ok(false)
+        reusableBuffer(nullptr)
     {
         // Convert to FileInputStream and get the path
         auto fileSourceStream = dynamic_cast<juce::FileInputStream*>(sourceStream);
