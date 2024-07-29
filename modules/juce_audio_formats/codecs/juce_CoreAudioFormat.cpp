@@ -730,13 +730,19 @@ bool CoreAudioFormat::canDoMono()       { return true; }
 AudioFormatReader* CoreAudioFormat::createReaderFor (InputStream* sourceStream,
                                                      bool deleteStreamIfOpeningFails)
 {
+    //time this with chrono
+    auto start = std::chrono::high_resolution_clock::now();
     std::unique_ptr<CoreAudioReader> r (new CoreAudioReader (sourceStream, streamKind));
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+    std::cout << "Elapsed time for CoreAudioReader: " << elapsed.count() << " s\n";
 
     if (r->ok)
         return r.release();
 
     if (! deleteStreamIfOpeningFails)
         r->input = nullptr;
+
 
     return nullptr;
 }
