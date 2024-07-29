@@ -99,6 +99,8 @@ namespace
 
         return {};
     }
+    constexpr auto DefaultBitsPerSample = 32;
+    constexpr auto InitialReusuableBufferSize = 2048;
 }
 
 //==============================================================================
@@ -388,13 +390,16 @@ class CoreAudioReader : public juce::AudioFormatReader
 public:
     using StreamKind = juce::CoreAudioFormat::StreamKind;
 
-    CoreAudioReader(juce::InputStream* sourceStream, StreamKind streamKind)
-    : AudioFormatReader(sourceStream, coreAudioFormatName), audioFile(nil)
+    CoreAudioReader(juce::InputStream* sourceStream, StreamKind streamKind) :
+        AudioFormatReader(sourceStream, coreAudioFormatName),
+        audioFile(nullptr),
+        reusableBuffer(nullptr)
     {
         // Convert to FileInputStream and get the path
         auto fileSourceStream = dynamic_cast<juce::FileInputStream*>(sourceStream);
 
-        if (fileSourceStream == nullptr) {
+        if (fileSourceStream == nullptr)
+        {
             NSLog(@"Error casting to FileInputStream");
             return;
         }
@@ -407,22 +412,22 @@ public:
 
         NSError* error = nil;
         audioFile = [[AVAudioFile alloc] initForReading:fileURL commonFormat:AVAudioPCMFormatFloat32 interleaved:NO error:&error];
-        if (error) {
+        if (error)
+        {
             NSLog(@"Error opening audio file: %@", error);
             return;
         }
 
-        // Get bits per sample from file format
-        bitsPerSample = 32;
+        bitsPerSample = DefaultBitsPerSample;
         sampleRate = audioFile.fileFormat.sampleRate;
         numChannels = audioFile.fileFormat.channelCount;
-        lengthInSamples = (juce::int64)audioFile.length;
+        lengthInSamples = static_cast<juce::int64>(audioFile.length);
         usesFloatingPointData = true;
 
         auto channelLayout = audioFile.fileFormat.channelLayout.layout;
         createChannelMap(channelLayout);
 
-        reusableBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:audioFile.processingFormat frameCapacity:2048];
+        reusableBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:audioFile.processingFormat frameCapacity:InitialReusuableBufferSize];
     }
 
     ~CoreAudioReader()
@@ -435,46 +440,50 @@ public:
         clearSamplesBeyondAvailableLength (destSamples, numDestChannels, startOffsetInDestBuffer,
                                            startSampleInFile, numSamples, lengthInSamples);
 
-        if (audioFile == nil) {
+        if (audioFile == nil)
+        {
             NSLog(@"Audio file is nil");
             return false;
         }
 
         if (!reusableBuffer ||
             ![reusableBuffer.format isEqual:audioFile.processingFormat] ||
-            reusableBuffer.frameCapacity < numSamples) {
+            reusableBuffer.frameCapacity < numSamples)
+        {
             NSLog(@"Creating new reusable buffer");
             reusableBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:audioFile.processingFormat frameCapacity:numSamples];
         }
 
         // Now check if startSampleInFile is the same as the current file position, if not change it
-        if (audioFile.framePosition != startSampleInFile) {
+        if (audioFile.framePosition != startSampleInFile)
+        {
             audioFile.framePosition = startSampleInFile;
         }
 
         NSError* error = nil;
         [audioFile readIntoBuffer:reusableBuffer frameCount:numSamples error:&error];
-        if (error) {
+        if (error)
+        {
             NSLog(@"Error reading audio file: %@", error);
             return false;
         }
 
-        auto numBytes = (size_t) numSamples * sizeof (float);
+        const auto numBytes = static_cast<size_t>(numSamples * sizeof(float));
 
-        // Also mostly copied from juce
+        // Also mostly copied from previous JUCE Reader
         for (int i = numDestChannels; --i >= 0;)
         {
-            auto* dest = destSamples[(i < (int) numChannels ? channelMap[i] : i)];
+            auto* dest = destSamples[(i < static_cast<int>(numChannels) ? channelMap[i] : i)];
 
             if (dest != nullptr)
             {
-                if (i < (int) numChannels)
+                if (i < static_cast<int>(numChannels))
                 {
-                    memcpy (dest + startOffsetInDestBuffer, reusableBuffer.floatChannelData[i], numBytes);
+                    std::memcpy(dest + startOffsetInDestBuffer, reusableBuffer.floatChannelData[i], numBytes);
                 }
                 else
                 {
-                    zeromem (dest + startOffsetInDestBuffer, numBytes);
+                    zeromem(dest + startOffsetInDestBuffer, numBytes);
                 }
             }
         }
@@ -484,29 +493,30 @@ public:
     
 private:
     // Mostly copied from all the existing juce stuff, left relatively untouched (hence why it looks messy)
-    void createChannelMap(AVAudioChannelLayout* channelLayout)
+    void createChannelMap(const AudioChannelLayout* channelLayout)
     {
         channelMap.malloc(numChannels);
         if (channelLayout != nullptr)
         {
-            auto fileLayout = CoreAudioLayouts::fromCoreAudio (*channelLayout);
+            auto fileLayout = juce::CoreAudioLayouts::fromCoreAudio(*channelLayout);
+            AudioChannelSet channelSet;
 
-            if (fileLayout && fileLayout.size() == static_cast<int> (numChannels))
+            if (fileLayout.size() == static_cast<int>(numChannels))
             {
                 channelSet = fileLayout;
             }
             
-            auto caOrder = juce::CoreAudioLayouts::getCoreAudioLayoutChannels (*channelLayout);
-            for (int i = 0; i < static_cast<int> (numChannels); ++i)
+            auto caOrder = juce::CoreAudioLayouts::getCoreAudioLayoutChannels(*channelLayout);
+            for (int i = 0; i < static_cast<int>(numChannels); ++i)
             {
-                auto idx = channelSet.getChannelIndexForType (caOrder.getReference (i));
-                jassert (isPositiveAndBelow (idx, static_cast<int> (numChannels));
+                auto idx = channelSet.getChannelIndexForType(caOrder.getReference(i));
+                jassert(isPositiveAndBelow (idx, static_cast<int>(numChannels)));
                 channelMap[i] = idx;
             }
         }
         else
         {
-            for (int i = 0; i < static_cast<int> (numChannels); ++i)
+            for (int i = 0; i < static_cast<int>(numChannels); ++i)
             {
                 channelMap[i] = i;
             }
@@ -516,7 +526,6 @@ private:
 private:
     AVAudioFile* audioFile;
     AVAudioPCMBuffer* reusableBuffer;
-    AudioChannelSet channelSet;
     HeapBlock<int> channelMap;
  
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (CoreAudioReader)
