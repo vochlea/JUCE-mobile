@@ -393,7 +393,8 @@ public:
     CoreAudioReader(juce::InputStream* sourceStream, StreamKind streamKind) :
         AudioFormatReader(sourceStream, coreAudioFormatName),
         audioFile(nullptr),
-        reusableBuffer(nullptr)
+        reusableBuffer(nullptr),
+        ok(false)
     {
         // Convert to FileInputStream and get the path
         auto fileSourceStream = dynamic_cast<juce::FileInputStream*>(sourceStream);
@@ -428,6 +429,8 @@ public:
         createChannelMap(channelLayout);
 
         reusableBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:audioFile.processingFormat frameCapacity:InitialReusuableBufferSize];
+        
+        ok = true;
     }
 
     ~CoreAudioReader()
@@ -522,6 +525,9 @@ private:
             }
         }
     }
+
+public:
+    bool ok;
     
 private:
     AVAudioFile* audioFile;
@@ -724,7 +730,7 @@ AudioFormatReader* CoreAudioFormat::createReaderFor (InputStream* sourceStream,
 {
     std::unique_ptr<CoreAudioReader> r (new CoreAudioReader (sourceStream, streamKind));
 
-    if (r)
+    if (r->ok)
         return r.release();
 
     if (! deleteStreamIfOpeningFails)
