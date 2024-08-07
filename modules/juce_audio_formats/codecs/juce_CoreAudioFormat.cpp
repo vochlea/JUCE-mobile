@@ -395,8 +395,8 @@ public:
     CoreAudioReader(juce::InputStream* sourceStream, StreamKind streamKind) :
         AudioFormatReader(sourceStream, coreAudioFormatName),
         ok(false),
-        audioFile(nullptr),
-        reusableBuffer(nullptr)
+        audioFile(nil),
+        reusableBuffer(nil)
     {
         // Convert to FileInputStream and get the path
         auto fileSourceStream = dynamic_cast<juce::FileInputStream*>(sourceStream);
@@ -427,7 +427,7 @@ public:
         lengthInSamples = static_cast<juce::int64>(audioFile.length);
         usesFloatingPointData = true;
 
-        auto channelLayout = audioFile.fileFormat.channelLayout.layout;
+        const auto channelLayout = audioFile.fileFormat.channelLayout.layout;
         createChannelMap(channelLayout);
 
         reusableBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:audioFile.processingFormat frameCapacity:InitialReusuableBufferSize];
@@ -435,9 +435,7 @@ public:
         ok = true;
     }
 
-    ~CoreAudioReader()
-    {
-    }
+    ~CoreAudioReader() = default;
 
     bool readSamples (int* const* destSamples, int numDestChannels, int startOffsetInDestBuffer,
                       juce::int64 startSampleInFile, int numSamples) override
@@ -511,7 +509,7 @@ private:
                 channelSet = fileLayout;
             }
             
-            auto caOrder = juce::CoreAudioLayouts::getCoreAudioLayoutChannels(*channelLayout);
+            const auto caOrder = juce::CoreAudioLayouts::getCoreAudioLayoutChannels(*channelLayout);
             for (int i = 0; i < static_cast<int>(numChannels); ++i)
             {
                 auto idx = channelSet.getChannelIndexForType(caOrder.getReference(i));
