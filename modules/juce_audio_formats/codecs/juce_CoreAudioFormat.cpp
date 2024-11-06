@@ -386,7 +386,6 @@ struct CoreAudioFormatMetatdata
         return isCafFile;
     }
 };
-
 class CoreAudioReader : public juce::AudioFormatReader
 {
 public:
@@ -396,7 +395,11 @@ public:
         AudioFormatReader(sourceStream, coreAudioFormatName),
         ok(false),
         audioFile(nil),
-        reusableBuffer(nil)
+        reusableBuffer(nil),
+        encoderDelay(streamKind == StreamKind::kAacAdts || 
+                    streamKind == StreamKind::kMpeg4 || 
+                    streamKind == StreamKind::kM4a || 
+                    streamKind == StreamKind::kM4b ? 2112 : 0)
     {
         // Convert to FileInputStream and get the path
         auto fileSourceStream = dynamic_cast<juce::FileInputStream*>(sourceStream);
@@ -424,7 +427,7 @@ public:
         bitsPerSample = DefaultBitsPerSample;
         sampleRate = audioFile.fileFormat.sampleRate;
         numChannels = audioFile.fileFormat.channelCount;
-        lengthInSamples = static_cast<juce::int64>(audioFile.length);
+        lengthInSamples = std::max(0ll, static_cast<juce::int64>(audioFile.length) - encoderDelay);
         usesFloatingPointData = true;
 
         const auto channelLayout = audioFile.fileFormat.channelLayout.layout;
@@ -432,16 +435,20 @@ public:
 
         reusableBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:audioFile.processingFormat frameCapacity:InitialReusuableBufferSize];
         
+        // If we have encoder delay, skip to the correct starting position
+        if (encoderDelay > 0)
+            audioFile.framePosition = encoderDelay;
+            
         ok = true;
     }
 
     ~CoreAudioReader() = default;
 
-    bool readSamples (int* const* destSamples, int numDestChannels, int startOffsetInDestBuffer,
-                      juce::int64 startSampleInFile, int numSamples) override
+    bool readSamples(int* const* destSamples, int numDestChannels, int startOffsetInDestBuffer,
+                    juce::int64 startSampleInFile, int numSamples) override
     {
-        clearSamplesBeyondAvailableLength (destSamples, numDestChannels, startOffsetInDestBuffer,
-                                           startSampleInFile, numSamples, lengthInSamples);
+        clearSamplesBeyondAvailableLength(destSamples, numDestChannels, startOffsetInDestBuffer,
+                                        startSampleInFile, numSamples, lengthInSamples);
 
         if (audioFile == nil)
         {
@@ -457,10 +464,13 @@ public:
             reusableBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:audioFile.processingFormat frameCapacity:numSamples];
         }
 
-        // Now check if startSampleInFile is the same as the current file position, if not change it
-        if (audioFile.framePosition != startSampleInFile)
+        // Account for encoder delay in file position
+        const auto adjustedStartSample = startSampleInFile + encoderDelay;
+        
+        // Now check if adjusted position is the same as the current file position
+        if (audioFile.framePosition != adjustedStartSample)
         {
-            audioFile.framePosition = startSampleInFile;
+            audioFile.framePosition = adjustedStartSample;
         }
 
         NSError* error = nil;
@@ -473,7 +483,6 @@ public:
 
         const auto numBytes = static_cast<size_t>(numSamples * sizeof(float));
 
-        // Also mostly copied from previous JUCE Reader
         for (int i = numDestChannels; --i >= 0;)
         {
             auto* dest = destSamples[(i < static_cast<int>(numChannels) ? channelMap[i] : i)];
@@ -495,7 +504,6 @@ public:
     }
     
 private:
-    // Mostly copied from all the existing juce stuff, left relatively untouched (hence why it looks messy)
     void createChannelMap(const AudioChannelLayout* channelLayout)
     {
         channelMap.malloc(numChannels);
@@ -513,7 +521,7 @@ private:
             for (int i = 0; i < static_cast<int>(numChannels); ++i)
             {
                 auto idx = channelSet.getChannelIndexForType(caOrder.getReference(i));
-                jassert(isPositiveAndBelow (idx, static_cast<int>(numChannels)));
+                jassert(isPositiveAndBelow(idx, static_cast<int>(numChannels)));
                 channelMap[i] = idx;
             }
         }
@@ -533,8 +541,9 @@ private:
     AVAudioFile* audioFile;
     AVAudioPCMBuffer* reusableBuffer;
     HeapBlock<int> channelMap;
+    const int encoderDelay;  // Made const since it won't change after construction
  
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (CoreAudioReader)
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(CoreAudioReader)
 };
 
 static AudioFormatID formatForFileType (AudioFileTypeID fileType)
