@@ -591,8 +591,9 @@ struct iOSAudioIODevice::Pimpl final : public AsyncUpdater
                             << ", targetBufferSize: " << targetBufferSize);
 
         setAudioSessionActive (true);
-        setAudioSessionCategory (requestedInputChannels > 0 ? AVAudioSessionCategoryPlayAndRecord
-                                                            : AVAudioSessionCategoryPlayback);
+        // This is a quick fix to prevent the play taking a long time in our mobile app - it stops the session category being constantly switched
+        // setAudioSessionCategory (requestedInputChannels > 0 ? AVAudioSessionCategoryPlayAndRecord
+        //                                                     : AVAudioSessionCategoryPlayback);
         channelData.reconfigure (requestedInputChannels, requestedOutputChannels);
         updateHardwareInfo (true);
         setTargetSampleRateAndBufferSize();
