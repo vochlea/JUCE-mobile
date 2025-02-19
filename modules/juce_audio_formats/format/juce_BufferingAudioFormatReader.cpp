@@ -1,24 +1,33 @@
 /*
   ==============================================================================
 
-   This file is part of the JUCE library.
-   Copyright (c) 2022 - Raw Material Software Limited
+   This file is part of the JUCE framework.
+   Copyright (c) Raw Material Software Limited
 
-   JUCE is an open source library subject to commercial or open-source
+   JUCE is an open source framework subject to commercial or open source
    licensing.
 
-   By using JUCE, you agree to the terms of both the JUCE 7 End-User License
-   Agreement and JUCE Privacy Policy.
+   By downloading, installing, or using the JUCE framework, or combining the
+   JUCE framework with any other source code, object code, content or any other
+   copyrightable work, you agree to the terms of the JUCE End User Licence
+   Agreement, and all incorporated terms including the JUCE Privacy Policy and
+   the JUCE Website Terms of Service, as applicable, which will bind you. If you
+   do not agree to the terms of these agreements, we will not license the JUCE
+   framework to you, and you must discontinue the installation or download
+   process and cease use of the JUCE framework.
 
-   End User License Agreement: www.juce.com/juce-7-licence
-   Privacy Policy: www.juce.com/juce-privacy-policy
+   JUCE End User Licence Agreement: https://juce.com/legal/juce-8-licence/
+   JUCE Privacy Policy: https://juce.com/juce-privacy-policy
+   JUCE Website Terms of Service: https://juce.com/juce-website-terms-of-service/
 
-   Or: You may also use this code under the terms of the GPL v3 (see
-   www.gnu.org/licenses).
+   Or:
 
-   JUCE IS PROVIDED "AS IS" WITHOUT ANY WARRANTY, AND ALL WARRANTIES, WHETHER
-   EXPRESSED OR IMPLIED, INCLUDING MERCHANTABILITY AND FITNESS FOR PURPOSE, ARE
-   DISCLAIMED.
+   You may also use this code under the terms of the AGPLv3:
+   https://www.gnu.org/licenses/agpl-3.0.en.html
+
+   THE JUCE FRAMEWORK IS PROVIDED "AS IS" WITHOUT ANY WARRANTY, AND ALL
+   WARRANTIES, WHETHER EXPRESSED OR IMPLIED, INCLUDING WARRANTY OF
+   MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE, ARE DISCLAIMED.
 
   ==============================================================================
 */
@@ -185,7 +194,7 @@ static bool isSilent (const AudioBuffer<float>& b)
     return true;
 }
 
-struct TestAudioFormatReader  : public AudioFormatReader
+struct TestAudioFormatReader : public AudioFormatReader
 {
     explicit TestAudioFormatReader (const AudioBuffer<float>* b)
         : AudioFormatReader (nullptr, {}),
@@ -204,6 +213,9 @@ struct TestAudioFormatReader  : public AudioFormatReader
     {
         clearSamplesBeyondAvailableLength (destChannels, numDestChannels, startOffsetInDestBuffer,
                                            startSampleInFile, numSamples, lengthInSamples);
+
+        if (numSamples <= 0)
+            return true;
 
         for (int j = 0; j < numDestChannels; ++j)
         {
@@ -238,19 +250,19 @@ static AudioBuffer<float> generateTestBuffer (Random& random, int bufferSize)
     return buffer;
 }
 
-class BufferingAudioReaderTests  : public UnitTest
+class BufferingAudioReaderTests final : public UnitTest
 {
 public:
     BufferingAudioReaderTests()  : UnitTest ("BufferingAudioReader", UnitTestCategories::audio)  {}
 
     void runTest() override
     {
-        TimeSliceThread timeSlice ("TestBackgroundThread");
-        timeSlice.startThread (Thread::Priority::normal);
+        TimeSliceThread thread ("TestBackgroundThread");
+        thread.startThread (Thread::Priority::normal);
 
-        beginTest ("Timeout");
+        beginTest ("Reading samples from a blocked reader should produce silence");
         {
-            struct BlockingReader  : public TestAudioFormatReader
+            struct BlockingReader final : public TestAudioFormatReader
             {
                 explicit BlockingReader (const AudioBuffer<float>* b)
                     : TestAudioFormatReader (b)
@@ -263,47 +275,50 @@ public:
                                   int64 startSampleInFile,
                                   int numSamples) override
                 {
-                    Thread::sleep (100);
+                    unblock.wait();
                     return TestAudioFormatReader::readSamples (destChannels, numDestChannels, startOffsetInDestBuffer, startSampleInFile, numSamples);
                 }
+
+                WaitableEvent unblock;
             };
 
             Random random { getRandom() };
+            constexpr auto bufferSize = 1024;
 
-            const auto blockingBuffer = generateTestBuffer (random, 1024);
-            expect (! isSilent (blockingBuffer));
+            const auto source = generateTestBuffer (random, bufferSize);
+            expect (! isSilent (source));
 
-            BufferingAudioReader bufferingReader (new BlockingReader (&blockingBuffer), timeSlice, 64);
-            bufferingReader.setReadTimeout (10);
+            auto* blockingReader = new BlockingReader (&source);
+            BufferingAudioReader reader (blockingReader, thread, bufferSize);
 
-            const auto originalBuffer = generateTestBuffer (random, 1024);
-            expect (! isSilent (originalBuffer));
-            expect (originalBuffer != blockingBuffer);
+            auto destination = generateTestBuffer (random, bufferSize);
+            expect (! isSilent (destination));
 
-            auto readBuffer = originalBuffer;
-            expect (readBuffer == originalBuffer);
+            read (reader, destination);
+            expect (isSilent (destination));
 
-            read (bufferingReader, readBuffer);
-            expect (readBuffer != originalBuffer);
-            expect (isSilent (readBuffer));
+            blockingReader->unblock.signal();
         }
 
-        beginTest ("Read samples");
+        beginTest ("Reading samples from a reader should produce the same samples as its source");
         {
             Random random { getRandom() };
 
             for (auto i = 4; i < 18; ++i)
             {
-                const auto backgroundBufferSize = 1 << i;
-                const auto buffer = generateTestBuffer (random, backgroundBufferSize);
+                const auto bufferSize = 1 << i;
+                const auto source = generateTestBuffer (random, bufferSize);
+                expect (! isSilent (source));
 
-                BufferingAudioReader bufferingReader (new TestAudioFormatReader (&buffer), timeSlice, backgroundBufferSize);
-                bufferingReader.setReadTimeout (-1);
+                BufferingAudioReader reader (new TestAudioFormatReader (&source), thread, bufferSize);
+                reader.setReadTimeout (-1);
 
-                AudioBuffer<float> readBuffer { buffer.getNumChannels(), buffer.getNumSamples() };
-                read (bufferingReader, readBuffer);
+                auto destination = generateTestBuffer (random, bufferSize);
+                expect (! isSilent (destination));
+                expect (source != destination);
 
-                expect (buffer == readBuffer);
+                read (reader, destination);
+                expect (source == destination);
             }
         }
     }

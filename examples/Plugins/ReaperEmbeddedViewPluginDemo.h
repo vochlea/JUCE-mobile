@@ -1,18 +1,22 @@
 /*
   ==============================================================================
 
-   This file is part of the JUCE examples.
-   Copyright (c) 2022 - Raw Material Software Limited
+   This file is part of the JUCE framework examples.
+   Copyright (c) Raw Material Software Limited
 
    The code included in this file is provided under the terms of the ISC license
    http://www.isc.org/downloads/software-support-policy/isc-license. Permission
-   To use, copy, modify, and/or distribute this software for any purpose with or
+   to use, copy, modify, and/or distribute this software for any purpose with or
    without fee is hereby granted provided that the above copyright notice and
    this permission notice appear in all copies.
 
-   THE SOFTWARE IS PROVIDED "AS IS" WITHOUT ANY WARRANTY, AND ALL WARRANTIES,
-   WHETHER EXPRESSED OR IMPLIED, INCLUDING MERCHANTABILITY AND FITNESS FOR
-   PURPOSE, ARE DISCLAIMED.
+   THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+   REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+   AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+   INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+   LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+   OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+   PERFORMANCE OF THIS SOFTWARE.
 
   ==============================================================================
 */
@@ -111,7 +115,7 @@ struct EmbeddedViewListener
 JUCE_BEGIN_IGNORE_WARNINGS_GCC_LIKE ("-Wnon-virtual-dtor")
 
 //==============================================================================
-class EmbeddedUI : public reaper::IReaperUIEmbedInterface
+class EmbeddedUI final : public reaper::IReaperUIEmbedInterface
 {
 public:
     explicit EmbeddedUI (EmbeddedViewListener& demo) : listener (demo) {}
@@ -146,7 +150,7 @@ private:
 
 JUCE_END_IGNORE_WARNINGS_GCC_LIKE
 
-class VST2Extensions : public VST2ClientExtensions
+class VST2Extensions final : public VST2ClientExtensions
 {
 public:
     explicit VST2Extensions (EmbeddedViewListener& l)
@@ -155,13 +159,9 @@ public:
     pointer_sized_int handleVstPluginCanDo (int32, pointer_sized_int, void* ptr, float) override
     {
         if (auto* str = static_cast<const char*> (ptr))
-        {
-            if (strcmp (str, "hasCockosEmbeddedUI") == 0)
-                return 0xbeef0000;
-
-            if (strcmp (str, "hasCockosExtensions") == 0)
-                return 0xbeef0000;
-        }
+            for (auto* key : { "hasCockosEmbeddedUI", "hasCockosExtensions" })
+                if (strcmp (str, key) == 0)
+                    return (pointer_sized_int) 0xbeef0000;
 
         return 0;
     }
@@ -191,7 +191,7 @@ private:
     EmbeddedViewListener& listener;
 };
 
-class VST3Extensions : public VST3ClientExtensions
+class VST3Extensions final : public VST3ClientExtensions
 {
 public:
     explicit VST3Extensions (EmbeddedViewListener& l)
@@ -226,7 +226,7 @@ private:
 };
 
 //==============================================================================
-class Editor : public AudioProcessorEditor
+class Editor final : public AudioProcessorEditor
 {
 public:
     explicit Editor (AudioProcessor& proc,
@@ -238,7 +238,7 @@ public:
         addAndMakeVisible (bypassButton);
 
         // Clicking will bypass *everything*
-        bypassButton.onClick = [globalBypass] { if (globalBypass != nullptr) globalBypass (-1); };
+        bypassButton.onClick = [globalBypass] { NullCheckedInvocation::invoke (globalBypass, -1); };
 
         setSize (300, 80);
     }
@@ -262,9 +262,9 @@ private:
 };
 
 //==============================================================================
-class ReaperEmbeddedViewDemo  : public AudioProcessor,
-                                private EmbeddedViewListener,
-                                private Timer
+class ReaperEmbeddedViewDemo final : public AudioProcessor,
+                                     private EmbeddedViewListener,
+                                     private Timer
 {
 public:
     ReaperEmbeddedViewDemo()

@@ -1,24 +1,33 @@
 /*
   ==============================================================================
 
-   This file is part of the JUCE library.
-   Copyright (c) 2022 - Raw Material Software Limited
+   This file is part of the JUCE framework.
+   Copyright (c) Raw Material Software Limited
 
-   JUCE is an open source library subject to commercial or open-source
+   JUCE is an open source framework subject to commercial or open source
    licensing.
 
-   By using JUCE, you agree to the terms of both the JUCE 7 End-User License
-   Agreement and JUCE Privacy Policy.
+   By downloading, installing, or using the JUCE framework, or combining the
+   JUCE framework with any other source code, object code, content or any other
+   copyrightable work, you agree to the terms of the JUCE End User Licence
+   Agreement, and all incorporated terms including the JUCE Privacy Policy and
+   the JUCE Website Terms of Service, as applicable, which will bind you. If you
+   do not agree to the terms of these agreements, we will not license the JUCE
+   framework to you, and you must discontinue the installation or download
+   process and cease use of the JUCE framework.
 
-   End User License Agreement: www.juce.com/juce-7-licence
-   Privacy Policy: www.juce.com/juce-privacy-policy
+   JUCE End User Licence Agreement: https://juce.com/legal/juce-8-licence/
+   JUCE Privacy Policy: https://juce.com/juce-privacy-policy
+   JUCE Website Terms of Service: https://juce.com/juce-website-terms-of-service/
 
-   Or: You may also use this code under the terms of the GPL v3 (see
-   www.gnu.org/licenses).
+   Or:
 
-   JUCE IS PROVIDED "AS IS" WITHOUT ANY WARRANTY, AND ALL WARRANTIES, WHETHER
-   EXPRESSED OR IMPLIED, INCLUDING MERCHANTABILITY AND FITNESS FOR PURPOSE, ARE
-   DISCLAIMED.
+   You may also use this code under the terms of the AGPLv3:
+   https://www.gnu.org/licenses/agpl-3.0.en.html
+
+   THE JUCE FRAMEWORK IS PROVIDED "AS IS" WITHOUT ANY WARRANTY, AND ALL
+   WARRANTIES, WHETHER EXPRESSED OR IMPLIED, INCLUDING WARRANTY OF
+   MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE, ARE DISCLAIMED.
 
   ==============================================================================
 */
@@ -41,7 +50,7 @@ extern Array<AppInactivityCallback*> appBecomingInactiveCallbacks;
 
 // On iOS, all GL calls will crash when the app is running in the background, so
 // this prevents them from happening (which some messy locking behaviour)
-struct iOSBackgroundProcessCheck  : public AppInactivityCallback
+struct iOSBackgroundProcessCheck final : public AppInactivityCallback
 {
     iOSBackgroundProcessCheck()              { isBackgroundProcess(); appBecomingInactiveCallbacks.add (this); }
     ~iOSBackgroundProcessCheck() override    { appBecomingInactiveCallbacks.removeAllInstancesOf (this); }
@@ -92,7 +101,7 @@ static bool contextHasTextureNpotFeature()
 }
 
 //==============================================================================
-class OpenGLContext::CachedImage  : public CachedComponentImage
+class OpenGLContext::CachedImage final : public CachedComponentImage
 {
     template <typename T, typename U>
     static constexpr bool isFlagSet (const T& t, const U& u) { return (t & u) != 0; }
@@ -319,9 +328,11 @@ public:
 
     RenderStatus renderFrame (MessageManager::Lock& mmLock)
     {
-       if (! isFlagSet (state, StateFlags::initialised))
-       {
-            switch (initialiseOnThread())
+        ScopedContextActivator contextActivator;
+
+        if (! isFlagSet (state, StateFlags::initialised))
+        {
+            switch (initialiseOnThread (contextActivator))
             {
                 case InitResult::fatal:
                 case InitResult::retry: return RenderStatus::noWork;
@@ -337,7 +348,6 @@ public:
        #endif
 
         std::optional<MessageManager::Lock::ScopedTryLockType> scopedLock;
-        ScopedContextActivator contextActivator;
 
         const auto stateToUse = state.fetch_and (StateFlags::persistent);
 
@@ -459,17 +469,22 @@ public:
             const auto localBounds = component.getLocalBounds();
             const auto newArea = peer->getComponent().getLocalArea (&component, localBounds).withZeroOrigin() * displayScale;
 
-           #if JUCE_WINDOWS && JUCE_WIN_PER_MONITOR_DPI_AWARE
-            // Some hosts (Pro Tools 2022.7) do not take the current DPI into account when sizing
-            // plugin editor windows. Instead of querying the OS for the DPI of the editor window,
+            // On Windows some hosts (Pro Tools 2022.7) do not take the current DPI into account
+            // when sizing plugin editor windows.
+            //
+            // Also in plugins on Windows, the plugin HWND's DPI settings generally don't reflect
+            // the desktop scaling setting and Displays::Display::scale will return an incorrect 1.0
+            // value. Our plugin wrappers will use a combination of querying the plugin HWND's
+            // parent HWND (the host HWND), and utilising the scale factor reported by the host
+            // through the plugin API. This scale is then added as a transformation to the
+            // AudioProcessorEditor.
+            //
+            // Hence, instead of querying the OS for the DPI of the editor window,
             // we approximate based on the physical size of the window that was actually provided
             // for the context to draw into. This may break if the OpenGL context's component is
             // scaled differently in its width and height - but in this case, a single scale factor
             // isn't that helpful anyway.
             const auto newScale = (float) newArea.getWidth() / (float) localBounds.getWidth();
-           #else
-            const auto newScale = (float) displayScale;
-           #endif
 
             areaAndScale.set ({ newArea, newScale }, [&]
             {
@@ -603,14 +618,14 @@ public:
     }
 
     //==============================================================================
-    InitResult initialiseOnThread()
+    InitResult initialiseOnThread (ScopedContextActivator& activator)
     {
         // On android, this can get called twice, so drop any previous state.
         associatedObjectNames.clear();
         associatedObjects.clear();
         cachedImageFrameBuffer.release();
 
-        context.makeActive();
+        activator.activate (context);
 
         if (const auto nativeResult = nativeContext->initialiseOnRenderThread (context); nativeResult != InitResult::success)
             return nativeResult;
@@ -623,7 +638,7 @@ public:
 
         gl::loadFunctions();
 
-       #if JUCE_DEBUG
+       #if JUCE_DEBUG && ! JUCE_DISABLE_ASSERTIONS
         if (getOpenGLVersion() >= Version { 4, 3 } && glDebugMessageCallback != nullptr)
         {
             glEnable (GL_DEBUG_OUTPUT);
@@ -634,7 +649,7 @@ public:
                 // The advantage of this callback is that it will catch *all* errors, even if we
                 // forget to check manually.
                 DBG ("OpenGL DBG message: " << message);
-                jassertquiet (type != GL_DEBUG_TYPE_ERROR && severity != GL_DEBUG_SEVERITY_HIGH);
+                jassert (type != GL_DEBUG_TYPE_ERROR && severity != GL_DEBUG_SEVERITY_HIGH);
             }, nullptr);
         }
        #endif
@@ -659,13 +674,13 @@ public:
     }
 
     //==============================================================================
-    struct BlockingWorker  : public OpenGLContext::AsyncWorker
+    struct BlockingWorker final : public OpenGLContext::AsyncWorker
     {
         BlockingWorker (OpenGLContext::AsyncWorker::Ptr && workerToUse)
             : originalWorker (std::move (workerToUse))
         {}
 
-        void operator() (OpenGLContext& calleeContext)
+        void operator() (OpenGLContext& calleeContext) override
         {
             if (originalWorker != nullptr)
                 (*originalWorker) (calleeContext);
@@ -884,7 +899,7 @@ public:
         {
             connection.emplace (sharedDisplayLinks->registerFactory ([this] (CGDirectDisplayID display)
             {
-                return [this, display]
+                return [this, display] (double)
                 {
                     if (display == lastDisplay)
                         triggerRepaint();
@@ -899,7 +914,7 @@ public:
     }
 
     //==============================================================================
-    class BufferSwapper : private AsyncUpdater
+    class BufferSwapper final : private AsyncUpdater
     {
     public:
         explicit BufferSwapper (CachedImage& img)
@@ -1061,8 +1076,8 @@ public:
 };
 
 //==============================================================================
-class OpenGLContext::Attachment  : public ComponentMovementWatcher,
-                                   private Timer
+class OpenGLContext::Attachment final : public ComponentMovementWatcher,
+                                        private Timer
 {
 public:
     Attachment (OpenGLContext& c, Component& comp)
@@ -1184,7 +1199,10 @@ private:
         auto& comp = *getComponent();
 
        #if JUCE_MAC
+        #if ! JUCE_MAC_API_VERSION_MIN_REQUIRED_AT_LEAST (15, 0)
+        // According to a warning triggered on macOS 15 and above this doesn't do anything!
         [[(NSView*) comp.getWindowHandle() window] disableScreenUpdatesUntilFlush];
+        #endif
        #endif
 
         if (auto* oldCachedImage = CachedImage::get (comp))
@@ -1209,6 +1227,8 @@ private:
         if (auto* cachedImage = CachedImage::get (*getComponent()))
             cachedImage->checkViewportBounds();
     }
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (Attachment)
 };
 
 //==============================================================================
@@ -1334,16 +1354,16 @@ OpenGLContext* OpenGLContext::getContextAttachedTo (Component& c) noexcept
     return nullptr;
 }
 
-static ThreadLocalValue<OpenGLContext*> currentThreadActiveContext;
+thread_local OpenGLContext* currentThreadActiveContext = nullptr;
 
 OpenGLContext* OpenGLContext::getCurrentContext()
 {
-    return currentThreadActiveContext.get();
+    return currentThreadActiveContext;
 }
 
 bool OpenGLContext::makeActive() const noexcept
 {
-    auto& current = currentThreadActiveContext.get();
+    auto& current = currentThreadActiveContext;
 
     if (nativeContext != nullptr && nativeContext->makeActive())
     {
@@ -1363,7 +1383,7 @@ bool OpenGLContext::isActive() const noexcept
 void OpenGLContext::deactivateCurrentContext()
 {
     NativeContext::deactivateCurrentContext();
-    currentThreadActiveContext.get() = nullptr;
+    currentThreadActiveContext = nullptr;
 }
 
 void OpenGLContext::triggerRepaint()
@@ -1520,9 +1540,9 @@ void OpenGLContext::copyTexture (const Rectangle<int>& targetClipArea,
     {
         OpenGLRendering::SavedBinding<OpenGLRendering::TraitsVAO> vaoBinding;
 
-        struct OverlayShaderProgram  : public ReferenceCountedObject
+        struct OverlayShaderProgram final : public ReferenceCountedObject
         {
-            OverlayShaderProgram (OpenGLContext& context)
+            explicit OverlayShaderProgram (OpenGLContext& context)
                 : program (context), params (program)
             {}
 
@@ -1541,7 +1561,7 @@ void OpenGLContext::copyTexture (const Rectangle<int>& targetClipArea,
                 return *program;
             }
 
-            struct BuiltProgram : public OpenGLShaderProgram
+            struct BuiltProgram final : public OpenGLShaderProgram
             {
                 explicit BuiltProgram (OpenGLContext& ctx)
                     : OpenGLShaderProgram (ctx)
@@ -1574,7 +1594,7 @@ void OpenGLContext::copyTexture (const Rectangle<int>& targetClipArea,
 
             struct Params
             {
-                Params (OpenGLShaderProgram& prog)
+                explicit Params (OpenGLShaderProgram& prog)
                     : positionAttribute (prog, "position"),
                       screenSize (prog, "screenSize"),
                       imageTexture (prog, "imageTexture"),
@@ -1606,6 +1626,11 @@ void OpenGLContext::copyTexture (const Rectangle<int>& targetClipArea,
         auto right  = (GLshort) targetClipArea.getRight();
         auto bottom = (GLshort) targetClipArea.getBottom();
         const GLshort vertices[] = { left, bottom, right, bottom, left, top, right, top };
+
+        GLint oldProgram{};
+        glGetIntegerv (GL_CURRENT_PROGRAM, &oldProgram);
+
+        const ScopeGuard bindPreviousProgram { [&] { extensions.glUseProgram ((GLuint) oldProgram); } };
 
         auto& program = OverlayShaderProgram::select (*this);
         program.params.set ((float) contextWidth, (float) contextHeight, anchorPosAndTextureSize.toFloat(), flippedVertically);
