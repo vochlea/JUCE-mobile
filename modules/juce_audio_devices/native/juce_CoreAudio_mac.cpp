@@ -1875,6 +1875,14 @@ private:
 
         const auto writePos = inputWrapper.sampleTime.load();
 
+        // PROBE8: temporary — output holdback margin, once every 2000 callbacks.
+        {
+            static std::atomic<int> probeCount { 0 };
+            if (probeCount.fetch_add (1, std::memory_order_relaxed) % 2000 == 0 && writePos != invalidSampleTime)
+                fprintf (stderr, "PROBE8_MARGIN %llu\n",
+                         static_cast<unsigned long long> (writePos - currentReadPos));
+        }
+
         // check for fifo underrun
         if (writePos != invalidSampleTime)
         {
