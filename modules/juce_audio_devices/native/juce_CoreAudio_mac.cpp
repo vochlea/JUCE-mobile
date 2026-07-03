@@ -32,6 +32,8 @@
   ==============================================================================
 */
 
+#include "juce_CombinerReanchorDetector.h"
+
 namespace juce
 {
 
@@ -1722,6 +1724,8 @@ private:
     AudioSampleBuffer fifo, scratchBuffer;
     CriticalSection closeLock;
     int targetLatency = 0;
+    CombinerReanchorDetector reanchorDetector;
+    static constexpr int reanchorAfterBlocks = 16;
     std::atomic<int> xruns { -1 };
     std::atomic<uint64_t> lastValidReadPosition { invalidSampleTime };
 
@@ -1760,6 +1764,7 @@ private:
     void reset()
     {
         xruns.store (0);
+        reanchorDetector.reset();
         fifo.clear();
         scratchBuffer.clear();
 
@@ -1888,6 +1893,20 @@ private:
 
                 return;
             }
+
+            // Vochlea: a one-shot anchor can land a block high (input burst inside the re-anchor
+            // window ratchets the margin permanently) — snap back after N consecutive sightings.
+            if (reanchorDetector.update (writePos - currentReadPos,
+                                         static_cast<std::uint64_t> (targetLatency + 2 * currentBufferSize),
+                                         reanchorAfterBlocks))
+            {
+                invalidateSampleTimes();
+
+                for (int i = 0; i < numChannels; ++i)
+                    FloatVectorOperations::clear (channels[i], n);
+
+                return;
+            }
         }
 
         // If there was an xrun, we want to output zeros until we're sure that there's some valid
@@ -1915,11 +1934,16 @@ private:
         readPos.compare_exchange_strong (currentReadPos, nextReadPos);
     }
 
-    void xrun() noexcept
+    void invalidateSampleTimes() noexcept
     {
         for (auto& d : getDeviceWrappers())
             d->sampleTime.store (invalidSampleTime);
+    }
 
+    void xrun() noexcept
+    {
+        invalidateSampleTimes();
+        reanchorDetector.reset();
         ++xruns;
     }
 
