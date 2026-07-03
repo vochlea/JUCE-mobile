@@ -32,6 +32,8 @@
   ==============================================================================
 */
 
+#include "juce_CombinerReanchorDetector.h"
+
 namespace juce
 {
 
@@ -1552,6 +1554,9 @@ public:
 
         currentSampleRate = sampleRate;
         currentBufferSize = bufferSize;
+
+        // Vochlea: hold back one block — the deterministic re-anchor (see outputAudioCallback)
+        // makes the underrun failure mode cheap, so no standing safety block is carried.
         targetLatency = bufferSize;
 
         for (auto& d : getDeviceWrappers())
@@ -1566,13 +1571,13 @@ public:
                 lastError = err;
                 return err;
             }
-
-            targetLatency += d->getLatencyInSamples();
         }
 
         const auto numOuts = outputWrapper.getChannelNames().size();
 
-        fifo.setSize (numOuts, targetLatency + (bufferSize * 2));
+        // Vochlea: extra FIFO depth costs no latency, only overflow-side drift headroom —
+        // the write head anchors targetLatency ahead of reads, leaving the rest as corridor.
+        fifo.setSize (numOuts, targetLatency + (bufferSize * 4));
         scratchBuffer.setSize (numOuts, bufferSize);
 
         return {};
@@ -1653,7 +1658,8 @@ public:
 
     int getOutputLatencyInSamples() override
     {
-        return targetLatency - getInputLatencyInSamples();
+        // Vochlea: targetLatency no longer includes the device latencies, so clamp at zero.
+        return jmax (0, targetLatency - getInputLatencyInSamples());
     }
 
     int getInputLatencyInSamples() override
@@ -1718,6 +1724,8 @@ private:
     AudioSampleBuffer fifo, scratchBuffer;
     CriticalSection closeLock;
     int targetLatency = 0;
+    CombinerReanchorDetector reanchorDetector;
+    static constexpr int reanchorAfterBlocks = 16;
     std::atomic<int> xruns { -1 };
     std::atomic<uint64_t> lastValidReadPosition { invalidSampleTime };
 
@@ -1756,6 +1764,7 @@ private:
     void reset()
     {
         xruns.store (0);
+        reanchorDetector.reset();
         fifo.clear();
         scratchBuffer.clear();
 
@@ -1817,11 +1826,16 @@ private:
         }
 
         auto currentWritePos = writePos.load();
+
+        // Vochlea: bail out BEFORE the advance — CASing invalidSampleTime + n would wrap the
+        // sentinel into a small "valid" position. Reachable now that input anchoring can defer.
+        if (currentWritePos == invalidSampleTime)
+            return;
+
         const auto nextWritePos = currentWritePos + static_cast<std::uint64_t> (n);
 
-        writePos.compare_exchange_strong (currentWritePos, nextWritePos);
-
-        if (currentWritePos == invalidSampleTime)
+        // Vochlea: CAS failure means a concurrent xrun() reset the head — don't touch the fifo.
+        if (! writePos.compare_exchange_strong (currentWritePos, nextWritePos))
             return;
 
         const auto readPos = outputWrapper.sampleTime.load();
@@ -1856,7 +1870,13 @@ private:
         auto currentReadPos = readPos.load();
 
         if (currentReadPos == invalidSampleTime)
+        {
+            // Vochlea: don't ship whatever was left in the hardware buffer while re-anchoring.
+            for (int i = 0; i < numChannels; ++i)
+                FloatVectorOperations::clear (channels[i], n);
+
             return;
+        }
 
         const auto writePos = inputWrapper.sampleTime.load();
 
@@ -1866,6 +1886,25 @@ private:
             if ((currentReadPos + static_cast<std::uint64_t> (n)) > writePos)
             {
                 xrun();
+
+                // Vochlea: the xrun click should be silence, not a block of stale hardware buffer.
+                for (int i = 0; i < numChannels; ++i)
+                    FloatVectorOperations::clear (channels[i], n);
+
+                return;
+            }
+
+            // Vochlea: a one-shot anchor can land a block high (input burst inside the re-anchor
+            // window ratchets the margin permanently) — snap back after N consecutive sightings.
+            if (reanchorDetector.update (writePos - currentReadPos,
+                                         static_cast<std::uint64_t> (targetLatency + 2 * currentBufferSize),
+                                         reanchorAfterBlocks))
+            {
+                invalidateSampleTimes();
+
+                for (int i = 0; i < numChannels; ++i)
+                    FloatVectorOperations::clear (channels[i], n);
+
                 return;
             }
         }
@@ -1895,11 +1934,16 @@ private:
         readPos.compare_exchange_strong (currentReadPos, nextReadPos);
     }
 
-    void xrun() noexcept
+    void invalidateSampleTimes() noexcept
     {
         for (auto& d : getDeviceWrappers())
             d->sampleTime.store (invalidSampleTime);
+    }
 
+    void xrun() noexcept
+    {
+        invalidateSampleTimes();
+        reanchorDetector.reset();
         ++xruns;
     }
 
@@ -2027,7 +2071,16 @@ private:
             auto callbackSampleTime = context.hostTimeNs != nullptr ? nsToSampleTime (*context.hostTimeNs) : 0;
 
             if (input)
-                callbackSampleTime += static_cast<std::uint64_t> (owner.targetLatency);
+            {
+                // Vochlea: anchor writes relative to the live output read head (JUCE-6-style) so
+                // generated output waits ~targetLatency, not the devices' summed stream latencies.
+                const auto readPos = owner.outputWrapper.sampleTime.load();
+
+                if (readPos == invalidSampleTime)
+                    return;
+
+                callbackSampleTime = readPos + static_cast<std::uint64_t> (owner.targetLatency);
+            }
 
             auto copy = invalidSampleTime;
 

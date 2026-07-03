@@ -147,6 +147,14 @@ void SamplerVoice::renderNextBlock (AudioBuffer<float>& outputBuffer, int startS
 
             auto envelopeValue = adsr.getNextSample();
 
+            // Vochlea: free the voice the instant its release completes (e.g. a
+            // choke-stop's short fade), instead of lingering silent to sample-end.
+            if (! adsr.isActive())
+            {
+                stopNote (0.0f, false);
+                break;
+            }
+
             l *= lgain * envelopeValue;
             r *= rgain * envelopeValue;
 
