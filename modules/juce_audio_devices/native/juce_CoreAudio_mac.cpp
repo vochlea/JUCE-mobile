@@ -1553,9 +1553,9 @@ public:
         currentSampleRate = sampleRate;
         currentBufferSize = bufferSize;
 
-        // Vochlea: hold back only 2 blocks (JUCE-6-style) instead of bufferSize + both device
-        // latencies — USB devices report ~30ms stream latency each, adding 30-60ms of holdback.
-        targetLatency = bufferSize * 2;
+        // Vochlea: hold back one block — the deterministic re-anchor (see outputAudioCallback)
+        // makes the underrun failure mode cheap, so no standing safety block is carried.
+        targetLatency = bufferSize;
 
         for (auto& d : getDeviceWrappers())
         {
