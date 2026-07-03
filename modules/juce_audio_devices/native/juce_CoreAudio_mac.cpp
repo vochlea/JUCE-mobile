@@ -1573,7 +1573,9 @@ public:
 
         const auto numOuts = outputWrapper.getChannelNames().size();
 
-        fifo.setSize (numOuts, targetLatency + (bufferSize * 2));
+        // Vochlea: extra FIFO depth costs no latency, only overflow-side drift headroom —
+        // the write head anchors targetLatency ahead of reads, leaving the rest as corridor.
+        fifo.setSize (numOuts, targetLatency + (bufferSize * 4));
         scratchBuffer.setSize (numOuts, bufferSize);
 
         return {};
@@ -1827,7 +1829,9 @@ private:
 
         const auto nextWritePos = currentWritePos + static_cast<std::uint64_t> (n);
 
-        writePos.compare_exchange_strong (currentWritePos, nextWritePos);
+        // Vochlea: CAS failure means a concurrent xrun() reset the head — don't touch the fifo.
+        if (! writePos.compare_exchange_strong (currentWritePos, nextWritePos))
+            return;
 
         const auto readPos = outputWrapper.sampleTime.load();
 
@@ -1861,7 +1865,13 @@ private:
         auto currentReadPos = readPos.load();
 
         if (currentReadPos == invalidSampleTime)
+        {
+            // Vochlea: don't ship whatever was left in the hardware buffer while re-anchoring.
+            for (int i = 0; i < numChannels; ++i)
+                FloatVectorOperations::clear (channels[i], n);
+
             return;
+        }
 
         const auto writePos = inputWrapper.sampleTime.load();
 
@@ -1871,6 +1881,11 @@ private:
             if ((currentReadPos + static_cast<std::uint64_t> (n)) > writePos)
             {
                 xrun();
+
+                // Vochlea: the xrun click should be silence, not a block of stale hardware buffer.
+                for (int i = 0; i < numChannels; ++i)
+                    FloatVectorOperations::clear (channels[i], n);
+
                 return;
             }
         }
