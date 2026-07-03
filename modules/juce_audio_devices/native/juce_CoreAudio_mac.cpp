@@ -1552,7 +1552,10 @@ public:
 
         currentSampleRate = sampleRate;
         currentBufferSize = bufferSize;
-        targetLatency = bufferSize;
+
+        // Vochlea: hold back only 2 blocks (JUCE-6-style) instead of bufferSize + both device
+        // latencies — USB devices report ~30ms stream latency each, adding 30-60ms of holdback.
+        targetLatency = bufferSize * 2;
 
         for (auto& d : getDeviceWrappers())
         {
@@ -1566,8 +1569,6 @@ public:
                 lastError = err;
                 return err;
             }
-
-            targetLatency += d->getLatencyInSamples();
         }
 
         const auto numOuts = outputWrapper.getChannelNames().size();
@@ -1653,7 +1654,8 @@ public:
 
     int getOutputLatencyInSamples() override
     {
-        return targetLatency - getInputLatencyInSamples();
+        // Vochlea: targetLatency no longer includes the device latencies, so clamp at zero.
+        return jmax (0, targetLatency - getInputLatencyInSamples());
     }
 
     int getInputLatencyInSamples() override
@@ -1817,12 +1819,15 @@ private:
         }
 
         auto currentWritePos = writePos.load();
+
+        // Vochlea: bail out BEFORE the advance — CASing invalidSampleTime + n would wrap the
+        // sentinel into a small "valid" position. Reachable now that input anchoring can defer.
+        if (currentWritePos == invalidSampleTime)
+            return;
+
         const auto nextWritePos = currentWritePos + static_cast<std::uint64_t> (n);
 
         writePos.compare_exchange_strong (currentWritePos, nextWritePos);
-
-        if (currentWritePos == invalidSampleTime)
-            return;
 
         const auto readPos = outputWrapper.sampleTime.load();
 
@@ -2027,7 +2032,16 @@ private:
             auto callbackSampleTime = context.hostTimeNs != nullptr ? nsToSampleTime (*context.hostTimeNs) : 0;
 
             if (input)
-                callbackSampleTime += static_cast<std::uint64_t> (owner.targetLatency);
+            {
+                // Vochlea: anchor writes relative to the live output read head (JUCE-6-style) so
+                // generated output waits ~targetLatency, not the devices' summed stream latencies.
+                const auto readPos = owner.outputWrapper.sampleTime.load();
+
+                if (readPos == invalidSampleTime)
+                    return;
+
+                callbackSampleTime = readPos + static_cast<std::uint64_t> (owner.targetLatency);
+            }
 
             auto copy = invalidSampleTime;
 
