@@ -214,6 +214,22 @@ static bool audioObjectSetProperty (AudioObjectID objectID,
     return true;
 }
 
+template <size_t FirstSize, size_t SecondSize>
+static constexpr auto makeAudioObjectPropertyAddresses (const std::array<AudioObjectPropertySelector, FirstSize>& first,
+                                                        const std::array<AudioObjectPropertySelector, SecondSize>& second)
+{
+    std::array<AudioObjectPropertyAddress, FirstSize + SecondSize> result {};
+    size_t index = 0;
+
+    for (const auto selector : first)
+        result[index++] = { selector, kAudioObjectPropertyScopeWildcard, kAudioObjectPropertyElementWildcard };
+
+    for (const auto selector : second)
+        result[index++] = { selector, kAudioObjectPropertyScopeWildcard, kAudioObjectPropertyElementWildcard };
+
+    return result;
+}
+
 //==============================================================================
 class ScopedAudioObjectPropertyListener final
 {
@@ -225,8 +241,9 @@ public:
         detach();
     }
 
+    template <size_t NumAddresses>
     void attach (AudioObjectID objectID,
-                 std::initializer_list<AudioObjectPropertyAddress> addressesIn,
+                 const std::array<AudioObjectPropertyAddress, NumAddresses>& addressesIn,
                  AudioObjectPropertyListenerProc listenerProc,
                  void* clientData)
     {
@@ -305,7 +322,17 @@ public:
         }
 
         if (queue != nullptr && ! registrations.empty())
+        {
+           #if JUCE_DEBUG
+            const auto drainStartTime = Time::getMillisecondCounterHiRes();
+           #endif
+
             dispatch_sync (queue, ^{});
+
+           #if JUCE_DEBUG
+            jassert ((Time::getMillisecondCounterHiRes() - drainStartTime) < 100.0);
+           #endif
+        }
 
         if (blockRemovalFailed)
         {
@@ -344,6 +371,8 @@ private:
    #if JUCE_DEBUG
     static bool isCoreAudioIOThread() noexcept
     {
+        // This name check fails open if Apple renames the IO thread, so silence is not
+        // proof that a callback is outside the realtime context.
         char threadName[64] {};
         return pthread_getname_np (pthread_self(), threadName, sizeof (threadName)) == 0
             && std::strcmp (threadName, "com.apple.audio.IOThread.client") == 0;
@@ -375,19 +404,20 @@ private:
 };
 
 //==============================================================================
-// A busy private serial listener queue delayed AudioDeviceStop by 842 ms, so IO-context
-// selectors use a null queue and perform only lifetime-independent atomic operations.
-class ScopedAudioObjectRealtimePropertyListener final
+// Apple dispatches processor-overload callbacks in IO context; a serial queue delayed
+// AudioDeviceStop by 842 ms, so this null-queue listener only performs independent atomics.
+// Its block/state leak is deliberate and bounded (~100 bytes per device open/close cycle).
+class ScopedXRunListener final
 {
 public:
-    ScopedAudioObjectRealtimePropertyListener() = default;
+    ScopedXRunListener() = default;
 
-    ~ScopedAudioObjectRealtimePropertyListener()
+    ~ScopedXRunListener()
     {
         detach();
     }
 
-    void attach (AudioObjectID objectIDIn, std::initializer_list<AudioObjectPropertyAddress> addresses)
+    void attach (AudioObjectID objectIDIn)
     {
         if (state != nullptr)
         {
@@ -411,6 +441,13 @@ public:
             processChanges (*listenerState, numAddresses, changedAddresses);
         });
        #endif
+
+        const std::array addresses
+        {
+            AudioObjectPropertyAddress { kAudioDeviceProcessorOverload,
+                                         kAudioObjectPropertyScopeWildcard,
+                                         kAudioObjectPropertyElementWildcard }
+        };
 
         registrations.reserve (addresses.size());
 
@@ -487,7 +524,7 @@ private:
     AudioObjectID objectID = kAudioObjectUnknown;
     AudioObjectPropertyListenerBlock listener = nullptr;
 
-    JUCE_DECLARE_NON_COPYABLE (ScopedAudioObjectRealtimePropertyListener)
+    JUCE_DECLARE_NON_COPYABLE (ScopedXRunListener)
 };
 
 template <typename T, typename OnError = IgnoreUnused>
@@ -588,6 +625,27 @@ class CoreAudioInternal final : private Timer,
                                 private AsyncUpdater
 {
 private:
+    // Subscription and handler filters must stay identical; these shared arrays prevent
+    // newly handled selectors from remaining silently unsubscribed after an upstream rebase.
+    static constexpr std::array<AudioObjectPropertySelector, 6> detailsChangedSelectors
+    {
+        kAudioDevicePropertyBufferSize,
+        kAudioDevicePropertyBufferFrameSize,
+        kAudioDevicePropertyNominalSampleRate,
+        kAudioDevicePropertyStreamFormat,
+        kAudioDevicePropertyDeviceIsAlive,
+        kAudioStreamPropertyPhysicalFormat,
+    };
+
+    static constexpr std::array<AudioObjectPropertySelector, 2> restartSelectors
+    {
+        kAudioDevicePropertyDeviceHasChanged,
+        kAudioObjectPropertyOwnedObjects,
+    };
+
+    static constexpr auto deviceListenerAddresses = makeAudioObjectPropertyAddresses (detailsChangedSelectors,
+                                                                                      restartSelectors);
+
     // members with deduced return types need to be defined before they
     // are used, so define it here. decltype doesn't help as you can't
     // capture anything in lambdas inside a decltype context.
@@ -608,36 +666,10 @@ public:
                            << (outStream != nullptr ? ("    outputDeviceId " + String (deviceID) + "\n") : "")
                            << getDeviceDetails().joinIntoString ("\n    "));
 
-        realtimePropertyListener.attach (deviceID,
-                                         { { kAudioDeviceProcessorOverload,
-                                             kAudioObjectPropertyScopeWildcard,
-                                             kAudioObjectPropertyElementWildcard } });
+        xrunListener.attach (deviceID);
 
         propertyListener.attach (deviceID,
-                                 { { kAudioDevicePropertyBufferSize,
-                                     kAudioObjectPropertyScopeWildcard,
-                                     kAudioObjectPropertyElementWildcard },
-                                   { kAudioDevicePropertyBufferFrameSize,
-                                     kAudioObjectPropertyScopeWildcard,
-                                     kAudioObjectPropertyElementWildcard },
-                                   { kAudioDevicePropertyNominalSampleRate,
-                                     kAudioObjectPropertyScopeWildcard,
-                                     kAudioObjectPropertyElementWildcard },
-                                   { kAudioDevicePropertyStreamFormat,
-                                     kAudioObjectPropertyScopeWildcard,
-                                     kAudioObjectPropertyElementWildcard },
-                                   { kAudioDevicePropertyDeviceIsAlive,
-                                     kAudioObjectPropertyScopeWildcard,
-                                     kAudioObjectPropertyElementWildcard },
-                                   { kAudioStreamPropertyPhysicalFormat,
-                                     kAudioObjectPropertyScopeWildcard,
-                                     kAudioObjectPropertyElementWildcard },
-                                   { kAudioDevicePropertyDeviceHasChanged,
-                                     kAudioObjectPropertyScopeWildcard,
-                                     kAudioObjectPropertyElementWildcard },
-                                   { kAudioObjectPropertyOwnedObjects,
-                                     kAudioObjectPropertyScopeWildcard,
-                                     kAudioObjectPropertyElementWildcard } },
+                                 deviceListenerAddresses,
                                  deviceListenerProc,
                                  this);
     }
@@ -646,7 +678,7 @@ public:
     {
         detachPropertyListener();
         stop (false);
-        realtimePropertyListener.detach();
+        xrunListener.detach();
     }
 
     void detachPropertyListener()
@@ -1042,12 +1074,18 @@ public:
 
         playing = scopedProcID.get() != nullptr && callback != nullptr;
 
+        if (playing.load())
+            stoppedOnDetailsFailure = false;
+
         return scopedProcID.get() != nullptr;
     }
 
     AudioIODeviceCallback* stop (bool leaveInterruptRunning)
     {
         const ScopedLock sl (callbackLock);
+
+        if (! leaveInterruptRunning)
+            stoppedOnDetailsFailure = false;
 
         auto result = std::exchange (callback, nullptr);
 
@@ -1175,8 +1213,8 @@ public:
 
     bool isPlaying() const { return playing.load(); }
 
-    int getXRunCount() const noexcept { return realtimePropertyListener.getXRunCount(); }
-    void resetXRunCount() noexcept    { realtimePropertyListener.resetXRunCount(); }
+    int getXRunCount() const noexcept { return xrunListener.getXRunCount(); }
+    void resetXRunCount() noexcept    { xrunListener.resetXRunCount(); }
 
     //==============================================================================
     struct Stream
@@ -1425,6 +1463,7 @@ private:
     AudioIODeviceCallback* callback = nullptr;
     CriticalSection callbackLock;
     bool audioDeviceStopPending = false;
+    bool stoppedOnDetailsFailure = false;
     std::atomic<bool> playing { false };
     double sampleRate = 0;
     int bufferSize = 0;
@@ -1433,7 +1472,7 @@ private:
     std::atomic<bool> detailsChangePending { false };
     std::atomic<bool> restartPending { false };
     std::atomic<bool> deviceListChangePending { false };
-    ScopedAudioObjectRealtimePropertyListener realtimePropertyListener;
+    ScopedXRunListener xrunListener;
     ScopedAudioObjectPropertyListener propertyListener;
 
     //==============================================================================
@@ -1461,10 +1500,17 @@ private:
                 restartPending.store (true, std::memory_order_release);
 
             startTimer (500);
+            stoppedOnDetailsFailure = true;
             owner.stopWithPendingCallback();
         }
-        else if (restartRequested || oldBufferSize != bufferSize || ! approximatelyEqual (oldSampleRate, sampleRate))
-            owner.restart();
+        else
+        {
+            const auto restartAfterDetailsFailure = stoppedOnDetailsFailure;
+            stoppedOnDetailsFailure = false;
+
+            if (restartRequested || restartAfterDetailsFailure || oldBufferSize != bufferSize || ! approximatelyEqual (oldSampleRate, sampleRate))
+                owner.restart();
+        }
     }
 
     void handleAsyncUpdate() override
@@ -1503,28 +1549,14 @@ private:
 
         const auto detailsChanged = std::any_of (pa, pa + numAddresses, [] (const AudioObjectPropertyAddress& x)
         {
-            constexpr UInt32 selectors[]
-            {
-                kAudioDevicePropertyBufferSize,
-                kAudioDevicePropertyBufferFrameSize,
-                kAudioDevicePropertyNominalSampleRate,
-                kAudioDevicePropertyStreamFormat,
-                kAudioDevicePropertyDeviceIsAlive,
-                kAudioStreamPropertyPhysicalFormat,
-            };
-
-            return std::find (std::begin (selectors), std::end (selectors), x.mSelector) != std::end (selectors);
+            return std::find (detailsChangedSelectors.begin(), detailsChangedSelectors.end(), x.mSelector)
+                != detailsChangedSelectors.end();
         });
 
         const auto requestedRestart = std::any_of (pa, pa + numAddresses, [] (const AudioObjectPropertyAddress& x)
         {
-            constexpr UInt32 selectors[]
-            {
-                kAudioDevicePropertyDeviceHasChanged,
-                kAudioObjectPropertyOwnedObjects,
-            };
-
-            return std::find (std::begin (selectors), std::end (selectors), x.mSelector) != std::end (selectors);
+            return std::find (restartSelectors.begin(), restartSelectors.end(), x.mSelector)
+                != restartSelectors.end();
         });
 
         if (detailsChanged)
@@ -1581,9 +1613,9 @@ public:
         jassert (internal != nullptr);
 
         propertyListener.attach (kAudioObjectSystemObject,
-                                 { { kAudioHardwarePropertyDevices,
-                                     kAudioObjectPropertyScopeWildcard,
-                                     kAudioObjectPropertyElementWildcard } },
+                                 std::array { AudioObjectPropertyAddress { kAudioHardwarePropertyDevices,
+                                                                           kAudioObjectPropertyScopeWildcard,
+                                                                           kAudioObjectPropertyElementWildcard } },
                                  hardwareListenerProc,
                                  internal.get());
     }
@@ -1736,6 +1768,7 @@ public:
 
 private:
     std::unique_ptr<CoreAudioInternal> internal;
+    // Must follow internal so reverse destruction detaches before its clientData is destroyed.
     ScopedAudioObjectPropertyListener  propertyListener;
     bool isOpen_ = false;
     String lastError;
@@ -1927,6 +1960,8 @@ public:
 
     void close() override
     {
+        JUCE_ASSERT_MESSAGE_THREAD
+
         const ScopedLock sl (closeLock);
 
         stopTimer();
@@ -2024,6 +2059,8 @@ public:
 
     void start (AudioIODeviceCallback* newCallback) override
     {
+        JUCE_ASSERT_MESSAGE_THREAD
+
         const ScopedLock sl (closeLock);
 
         const auto shouldStart = [&]
@@ -2057,6 +2094,8 @@ public:
 
     void stop() override
     {
+        JUCE_ASSERT_MESSAGE_THREAD
+
         const ScopedLock sl (closeLock);
 
         stopTimer();
@@ -2104,6 +2143,8 @@ private:
 
     void timerCallback() override
     {
+        JUCE_ASSERT_MESSAGE_THREAD
+
         const ScopedLock sl (closeLock);
 
         stopTimer();
@@ -2565,9 +2606,9 @@ public:
     CoreAudioIODeviceType()  : AudioIODeviceType ("CoreAudio")
     {
         propertyListener.attach (kAudioObjectSystemObject,
-                                 { { kAudioHardwarePropertyDevices,
-                                     kAudioObjectPropertyScopeWildcard,
-                                     kAudioObjectPropertyElementWildcard } },
+                                 std::array { AudioObjectPropertyAddress { kAudioHardwarePropertyDevices,
+                                                                           kAudioObjectPropertyScopeWildcard,
+                                                                           kAudioObjectPropertyElementWildcard } },
                                  hardwareListenerProc,
                                  this);
     }
