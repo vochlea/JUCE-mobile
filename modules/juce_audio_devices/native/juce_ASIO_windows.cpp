@@ -1483,17 +1483,29 @@ public:
     {
         jassert (hasScanned); // need to call scanForDevices() before doing this
 
-        for (int i = deviceNames.size(); --i >= 0;)
-            if (deviceNames[i].containsIgnoreCase ("asio4all"))
-                return i; // asio4all is a safe choice for a default..
+        auto startIndex = 0;
 
        #if JUCE_DEBUG
         if (deviceNames.size() > 1 && deviceNames[0].containsIgnoreCase ("digidesign"))
-            return 1; // (the digi m-box driver crashes the app when you run
-                      // it in the debugger, which can be a bit annoying)
+        {
+            startIndex = 1; // (the digi m-box driver crashes the app when you run
+                            // it in the debugger, which can be a bit annoying)
+        }
        #endif
 
-        return 0;
+        // Vochlea: stock preferred asio4all. It is a WDM-KS wrapper, not a vendor driver, and
+        // takes the endpoint exclusively -- system audio dies. De-preferred rather than merely
+        // un-preferred because registry order usually puts it at index 0, so falling through to
+        // `return 0` would keep the same wrong default. Still returned if it is the only driver.
+        for (int i = startIndex; i < deviceNames.size(); ++i)
+        {
+            if (! deviceNames[i].containsIgnoreCase ("asio4all"))
+            {
+                return i;
+            }
+        }
+
+        return startIndex;
     }
 
     static int findFreeSlot()

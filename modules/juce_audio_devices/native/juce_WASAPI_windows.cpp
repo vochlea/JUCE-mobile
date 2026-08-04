@@ -732,8 +732,9 @@ private:
     ComSmartPtr<SessionEventCallback> sessionEventCallback;
 
     // Vochlea: latch once this endpoint has proved it cannot open with the corresponding
-    // stream option. MATCH_FORMAT is dropped first (it is the option that provokes
-    // AUDCLNT_E_ENGINE_FORMAT_LOCKED); RAW is only ever dropped as a last resort.
+    // stream option. MATCH_FORMAT is dropped first (it is the option that provokes both
+    // AUDCLNT_E_ENGINE_FORMAT_LOCKED and _PERIODICITY_LOCKED); RAW is only ever dropped as a
+    // last resort.
     bool matchFormatDisabled = false, rawStreamOptionsDisabled = false;
 
     // Vochlea: whether the client currently held by `client` was configured with stream options,
@@ -854,9 +855,10 @@ private:
         properties.eCategory  = AudioCategory_Other;
 
         // MATCH_FORMAT asks the engine to adopt the format we are about to request instead of
-        // resampling us into its own. It is only requested on the low-latency path, because
-        // that is the only path below that knows how to recover from AUDCLNT_E_ENGINE_FORMAT_LOCKED
-        // when another process already owns the engine format.
+        // resampling us into its own. It is only requested on the low-latency path, because that
+        // is the only path below that knows how to recover from the two errors it provokes -
+        // AUDCLNT_E_ENGINE_FORMAT_LOCKED / _PERIODICITY_LOCKED - when another process already owns
+        // the engine.
         properties.Options = (isLowLatencyMode (deviceMode) && ! matchFormatDisabled)
                                  ? (AUDCLNT_STREAMOPTIONS) (AUDCLNT_STREAMOPTIONS_RAW | AUDCLNT_STREAMOPTIONS_MATCH_FORMAT)
                                  : AUDCLNT_STREAMOPTIONS_RAW;
@@ -1139,7 +1141,8 @@ private:
         guarantees the format has at least numChannels channels and a container updateFormat
         can convert; an engine format satisfies neither, and channelMaps is built from the
         requested channels afterwards, so adopting one can index past the end of a frame. The
-        recovery for a locked format is to stop asking for MATCH_FORMAT, not to change format.
+        recovery for either lock is to stop asking for MATCH_FORMAT and join the engine's own
+        period - not to change format.
     */
     bool initialiseLowLatencyClient (int bufferSizeSamples, WAVEFORMATEXTENSIBLE format)
     {
@@ -1151,7 +1154,8 @@ private:
 
         auto periodFrames = (UINT32) bufferSizeSamples;
 
-        // One initial attempt plus at most one period retry and one format retry.
+        // One initial attempt plus at most two retries. On the usual refusal both recoveries -
+        // dropping MATCH_FORMAT and adopting the engine's period - are applied by the same pass.
         for (int attempt = 0; attempt < 3; ++attempt)
         {
             auto hr = audioClient3->InitializeSharedAudioStream (getStreamFlags(),
@@ -1200,10 +1204,15 @@ private:
 
             CoTaskMemFree (currentFormat);
 
-            // MATCH_FORMAT is what provokes FORMAT_LOCKED, so the retry has to drop it or it
-            // just earns the same error again. If it was already off, the engine is holding a
-            // format we cannot satisfy and the standard-client fallback is the answer.
-            if (formatLocked && ! matchFormatDisabled)
+            // Vochlea: MATCH_FORMAT provokes BOTH locks - Microsoft returns either one only when
+            // it was requested, and documents the same recovery for both: call SetClientProperties
+            // without the match-format option, then use the engine's current format/periodicity.
+            // Dropping it on a periodicity lock as well is what makes the period retry above mean
+            // anything: reapplying MATCH_FORMAT just earns the same error, and periodFrames now
+            // equals the engine period so nothing would have `changed` on the next pass. If it was
+            // already off, the engine holds terms we cannot meet and the standard client is the
+            // answer.
+            if ((periodicityLocked || formatLocked) && ! matchFormatDisabled)
             {
                 matchFormatDisabled = true;
                 changed = true;
