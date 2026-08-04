@@ -682,6 +682,8 @@ public:
     String getLastError() override           { return error; }
     bool hasControlPanel() const override    { return true; }
 
+    bool isInsideDeviceReset() const noexcept override    { return insideResetCallback; }
+
     bool showControlPanel() override
     {
         JUCE_ASIO_LOG ("showing control panel");
@@ -719,6 +721,13 @@ public:
         {
             stopTimer();
             JUCE_ASIO_LOG ("restart request!");
+
+            /*  Vochlea: open() below pumps the message queue, so anything watching this device
+                can be dispatched while it is transiently closed. Without this latch the device
+                is indistinguishable from one that died, and a watchdog that reacts by deleting
+                it frees the object this frame is still running on.
+            */
+            const ScopedValueSetter<bool> resetting (insideResetCallback, true);
 
             auto* oldCallback = currentCallback;
             close();
@@ -775,6 +784,7 @@ private:
     std::atomic<bool> calledback { false };
     bool postOutput = true, needToReset = false;
     bool insideControlPanelModalLoop = false;
+    bool insideResetCallback = false;
     bool shouldUsePreferredSize = false;
     int xruns = 0;
 
