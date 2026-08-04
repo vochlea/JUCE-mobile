@@ -34,6 +34,10 @@
 
 #include "juce_CombinerReanchorDetector.h"
 
+#if ! __has_feature (objc_arc)
+ #include <Block.h>
+#endif
+
 namespace juce
 {
 
@@ -210,6 +214,319 @@ static bool audioObjectSetProperty (AudioObjectID objectID,
     return true;
 }
 
+template <size_t FirstSize, size_t SecondSize>
+static constexpr auto makeAudioObjectPropertyAddresses (const std::array<AudioObjectPropertySelector, FirstSize>& first,
+                                                        const std::array<AudioObjectPropertySelector, SecondSize>& second)
+{
+    std::array<AudioObjectPropertyAddress, FirstSize + SecondSize> result {};
+    size_t index = 0;
+
+    for (const auto selector : first)
+        result[index++] = { selector, kAudioObjectPropertyScopeWildcard, kAudioObjectPropertyElementWildcard };
+
+    for (const auto selector : second)
+        result[index++] = { selector, kAudioObjectPropertyScopeWildcard, kAudioObjectPropertyElementWildcard };
+
+    return result;
+}
+
+//==============================================================================
+class ScopedAudioObjectPropertyListener final
+{
+public:
+    ScopedAudioObjectPropertyListener() = default;
+
+    ~ScopedAudioObjectPropertyListener()
+    {
+        detach();
+    }
+
+    template <size_t NumAddresses>
+    void attach (AudioObjectID objectID,
+                 const std::array<AudioObjectPropertyAddress, NumAddresses>& addressesIn,
+                 AudioObjectPropertyListenerProc listenerProc,
+                 void* clientData)
+    {
+        if (state != nullptr)
+        {
+            jassertfalse;
+            JUCE_COREAUDIOLOG ("Ignoring duplicate property-listener attachment")
+            return;
+        }
+
+        state = std::make_shared<State> (objectID, listenerProc, clientData);
+        queue = dispatch_queue_create ("com.juce.CoreAudioPropertyListener", DISPATCH_QUEUE_SERIAL);
+
+        const auto listenerState = state;
+
+        // Property handlers must not lock, call HAL synchronously, or dispatch-sync to main;
+        // detach() drain-barriers this queue, so handlers stay atomic-stores-plus-async-trigger only.
+       #if __has_feature (objc_arc)
+        listener = ^(UInt32 numAddresses, const AudioObjectPropertyAddress* addresses)
+        {
+           #if JUCE_DEBUG
+            jassert (! isCoreAudioIOThread());
+           #endif
+
+            if (! listenerState->detached.load (std::memory_order_acquire))
+                listenerState->listenerProc (listenerState->objectID, numAddresses, addresses, listenerState->clientData);
+        };
+       #else
+        listener = Block_copy (^(UInt32 numAddresses, const AudioObjectPropertyAddress* addresses)
+        {
+           #if JUCE_DEBUG
+            jassert (! isCoreAudioIOThread());
+           #endif
+
+            if (! listenerState->detached.load (std::memory_order_acquire))
+                listenerState->listenerProc (listenerState->objectID, numAddresses, addresses, listenerState->clientData);
+        });
+       #endif
+
+        registrations.reserve (addressesIn.size());
+
+        for (const auto address : addressesIn)
+        {
+            const auto status = queue != nullptr && listener != nullptr
+                              ? AudioObjectAddPropertyListenerBlock (objectID, &address, queue, listener)
+                              : static_cast<OSStatus> (kAudioHardwareUnspecifiedError);
+
+            JUCE_COREAUDIOLOG ("AudioObjectAddPropertyListenerBlock (" << String::toHexString ((int) address.mSelector)
+                               << ") returned " << String::toHexString ((int) status))
+
+            if (status == noErr)
+                registrations.push_back (address);
+        }
+    }
+
+    void detach()
+    {
+        if (state == nullptr)
+            return;
+
+       #if JUCE_COREAUDIO_LOGGING_ENABLED
+        const auto detachStartTime = Time::getMillisecondCounterHiRes();
+       #endif
+
+        state->detached.store (true, std::memory_order_release);
+        bool blockRemovalFailed = false;
+
+        for (const auto& address : registrations)
+        {
+            const auto status = AudioObjectRemovePropertyListenerBlock (state->objectID, &address, queue, listener);
+            JUCE_COREAUDIOLOG ("AudioObjectRemovePropertyListenerBlock ("
+                               << String::toHexString ((int) address.mSelector)
+                               << ") returned " << String::toHexString ((int) status))
+
+            blockRemovalFailed = blockRemovalFailed || status != noErr;
+        }
+
+        if (queue != nullptr && ! registrations.empty())
+        {
+           #if JUCE_DEBUG
+            const auto drainStartTime = Time::getMillisecondCounterHiRes();
+           #endif
+
+            dispatch_sync (queue, ^{});
+
+           #if JUCE_DEBUG
+            jassert ((Time::getMillisecondCounterHiRes() - drainStartTime) < 100.0);
+           #endif
+        }
+
+        if (blockRemovalFailed)
+        {
+            // CoreAudio may still dispatch through these objects; leak them rather than release live storage.
+           #if __has_feature (objc_arc)
+            if (listener != nullptr)
+                static_cast<void> ((__bridge_retained void*) listener);
+
+            if (queue != nullptr)
+                static_cast<void> ((__bridge_retained void*) queue);
+           #endif
+        }
+        else
+        {
+           #if ! __has_feature (objc_arc)
+            if (listener != nullptr)
+                Block_release (listener);
+
+            if (queue != nullptr)
+                dispatch_release (queue);
+           #endif
+        }
+
+       #if JUCE_COREAUDIO_LOGGING_ENABLED
+        JUCE_COREAUDIOLOG ("Property-listener detach took "
+                           << (Time::getMillisecondCounterHiRes() - detachStartTime) << " ms")
+       #endif
+
+        listener = nullptr;
+        queue = nullptr;
+        state.reset();
+        registrations.clear();
+    }
+
+private:
+   #if JUCE_DEBUG
+    static bool isCoreAudioIOThread() noexcept
+    {
+        // This name check fails open if Apple renames the IO thread, so silence is not
+        // proof that a callback is outside the realtime context.
+        char threadName[64] {};
+        return pthread_getname_np (pthread_self(), threadName, sizeof (threadName)) == 0
+            && std::strcmp (threadName, "com.apple.audio.IOThread.client") == 0;
+    }
+   #endif
+
+    struct State
+    {
+        State (AudioObjectID objectIDIn,
+               AudioObjectPropertyListenerProc listenerProcIn,
+               void* clientDataIn)
+            : objectID (objectIDIn),
+              listenerProc (listenerProcIn),
+              clientData (clientDataIn)
+        {}
+
+        const AudioObjectID objectID;
+        const AudioObjectPropertyListenerProc listenerProc;
+        void* const clientData;
+        std::atomic<bool> detached { false };
+    };
+
+    std::shared_ptr<State> state;
+    std::vector<AudioObjectPropertyAddress> registrations;
+    dispatch_queue_t queue = nullptr;
+    AudioObjectPropertyListenerBlock listener = nullptr;
+
+    JUCE_DECLARE_NON_COPYABLE (ScopedAudioObjectPropertyListener)
+};
+
+//==============================================================================
+// Apple dispatches processor-overload callbacks in IO context; a serial queue delayed
+// AudioDeviceStop by 842 ms, so this null-queue listener only performs independent atomics.
+// Its block/state leak is deliberate and bounded (~100 bytes per device open/close cycle).
+class ScopedXRunListener final
+{
+public:
+    ScopedXRunListener() = default;
+
+    ~ScopedXRunListener()
+    {
+        detach();
+    }
+
+    void attach (AudioObjectID objectIDIn)
+    {
+        if (state != nullptr)
+        {
+            jassertfalse;
+            JUCE_COREAUDIOLOG ("Ignoring duplicate realtime property-listener attachment")
+            return;
+        }
+
+        state = std::make_shared<State>();
+        objectID = objectIDIn;
+        const auto listenerState = state;
+
+       #if __has_feature (objc_arc)
+        listener = ^(UInt32 numAddresses, const AudioObjectPropertyAddress* changedAddresses)
+        {
+            processChanges (*listenerState, numAddresses, changedAddresses);
+        };
+       #else
+        listener = Block_copy (^(UInt32 numAddresses, const AudioObjectPropertyAddress* changedAddresses)
+        {
+            processChanges (*listenerState, numAddresses, changedAddresses);
+        });
+       #endif
+
+        const std::array addresses
+        {
+            AudioObjectPropertyAddress { kAudioDeviceProcessorOverload,
+                                         kAudioObjectPropertyScopeWildcard,
+                                         kAudioObjectPropertyElementWildcard }
+        };
+
+        registrations.reserve (addresses.size());
+
+        for (const auto address : addresses)
+        {
+            const auto status = listener != nullptr
+                              ? AudioObjectAddPropertyListenerBlock (objectID, &address, nullptr, listener)
+                              : static_cast<OSStatus> (kAudioHardwareUnspecifiedError);
+
+            JUCE_COREAUDIOLOG ("AudioObjectAddPropertyListenerBlock realtime (" << String::toHexString ((int) address.mSelector)
+                               << ") returned " << String::toHexString ((int) status))
+
+            if (status == noErr)
+                registrations.push_back (address);
+        }
+    }
+
+    void detach()
+    {
+        if (state == nullptr || state->detached.exchange (true, std::memory_order_acq_rel))
+            return;
+
+        for (const auto& address : registrations)
+        {
+            [[maybe_unused]] const auto status = AudioObjectRemovePropertyListenerBlock (objectID, &address, nullptr, listener);
+            JUCE_COREAUDIOLOG ("AudioObjectRemovePropertyListenerBlock realtime ("
+                               << String::toHexString ((int) address.mSelector)
+                               << ") returned " << String::toHexString ((int) status))
+        }
+
+        // A null-queue listener may still be running after removal, so leak the block
+        // and its captured state.
+       #if __has_feature (objc_arc)
+        if (listener != nullptr)
+            static_cast<void> ((__bridge_retained void*) listener);
+       #endif
+
+        listener = nullptr;
+        registrations.clear();
+    }
+
+    int getXRunCount() const noexcept
+    {
+        return state != nullptr ? state->xruns.load (std::memory_order_relaxed) : 0;
+    }
+
+    void resetXRunCount() noexcept
+    {
+        if (state != nullptr)
+            state->xruns.store (0, std::memory_order_relaxed);
+    }
+
+private:
+    struct State
+    {
+        std::atomic<bool> detached { false };
+        std::atomic<int> xruns { 0 };
+    };
+
+    static void processChanges (State& listenerState,
+                                UInt32 numAddresses,
+                                const AudioObjectPropertyAddress* addresses) noexcept
+    {
+        if (listenerState.detached.load (std::memory_order_acquire))
+            return;
+
+        for (UInt32 i = 0; i < numAddresses; ++i)
+            if (addresses[i].mSelector == kAudioDeviceProcessorOverload)
+                listenerState.xruns.fetch_add (1, std::memory_order_relaxed);
+    }
+
+    std::shared_ptr<State> state;
+    std::vector<AudioObjectPropertyAddress> registrations;
+    AudioObjectID objectID = kAudioObjectUnknown;
+    AudioObjectPropertyListenerBlock listener = nullptr;
+
+    JUCE_DECLARE_NON_COPYABLE (ScopedXRunListener)
+};
+
 template <typename T, typename OnError = IgnoreUnused>
 [[nodiscard]] static std::vector<T> audioObjectGetProperties (AudioObjectID objectID,
                                                               const AudioObjectPropertyAddress address,
@@ -308,6 +625,27 @@ class CoreAudioInternal final : private Timer,
                                 private AsyncUpdater
 {
 private:
+    // Subscription and handler filters must stay identical; these shared arrays prevent
+    // newly handled selectors from remaining silently unsubscribed after an upstream rebase.
+    static constexpr std::array<AudioObjectPropertySelector, 6> detailsChangedSelectors
+    {
+        kAudioDevicePropertyBufferSize,
+        kAudioDevicePropertyBufferFrameSize,
+        kAudioDevicePropertyNominalSampleRate,
+        kAudioDevicePropertyStreamFormat,
+        kAudioDevicePropertyDeviceIsAlive,
+        kAudioStreamPropertyPhysicalFormat,
+    };
+
+    static constexpr std::array<AudioObjectPropertySelector, 2> restartSelectors
+    {
+        kAudioDevicePropertyDeviceHasChanged,
+        kAudioObjectPropertyOwnedObjects,
+    };
+
+    static constexpr auto deviceListenerAddresses = makeAudioObjectPropertyAddresses (detailsChangedSelectors,
+                                                                                      restartSelectors);
+
     // members with deduced return types need to be defined before they
     // are used, so define it here. decltype doesn't help as you can't
     // capture anything in lambdas inside a decltype context.
@@ -328,27 +666,26 @@ public:
                            << (outStream != nullptr ? ("    outputDeviceId " + String (deviceID) + "\n") : "")
                            << getDeviceDetails().joinIntoString ("\n    "));
 
-        AudioObjectPropertyAddress pa;
-        pa.mSelector = kAudioObjectPropertySelectorWildcard;
-        pa.mScope = kAudioObjectPropertyScopeWildcard;
-        pa.mElement = kAudioObjectPropertyElementWildcard;
+        xrunListener.attach (deviceID);
 
-        AudioObjectAddPropertyListener (deviceID, &pa, deviceListenerProc, this);
+        propertyListener.attach (deviceID,
+                                 deviceListenerAddresses,
+                                 deviceListenerProc,
+                                 this);
     }
 
     ~CoreAudioInternal() override
     {
+        detachPropertyListener();
+        stop (false);
+        xrunListener.detach();
+    }
+
+    void detachPropertyListener()
+    {
         stopTimer();
         cancelPendingUpdate();
-
-        AudioObjectPropertyAddress pa;
-        pa.mSelector = kAudioObjectPropertySelectorWildcard;
-        pa.mScope = kAudioObjectPropertyScopeWildcard;
-        pa.mElement = kAudioObjectPropertyElementWildcard;
-
-        AudioObjectRemovePropertyListener (deviceID, &pa, deviceListenerProc, this);
-
-        stop (false);
+        propertyListener.detach();
     }
 
     auto getStreams() const { return std::array<Stream*, 2> { { inStream.get(), outStream.get() } }; }
@@ -647,7 +984,14 @@ public:
     String reopen (const BigInteger& ins, const BigInteger& outs, double newSampleRate, int bufferSizeSamples)
     {
         callbacksAllowed = false;
-        const ScopeGuard scope { [&] { callbacksAllowed = true; } };
+        const ScopeGuard scope { [&]
+                                 {
+                                     callbacksAllowed = true;
+
+                                     if (detailsChangePending.load (std::memory_order_acquire)
+                                          || restartPending.load (std::memory_order_acquire))
+                                         triggerAsyncUpdate();
+                                 } };
 
         stopTimer();
 
@@ -730,12 +1074,18 @@ public:
 
         playing = scopedProcID.get() != nullptr && callback != nullptr;
 
+        if (playing.load())
+            stoppedOnDetailsFailure = false;
+
         return scopedProcID.get() != nullptr;
     }
 
     AudioIODeviceCallback* stop (bool leaveInterruptRunning)
     {
         const ScopedLock sl (callbackLock);
+
+        if (! leaveInterruptRunning)
+            stoppedOnDetailsFailure = false;
 
         auto result = std::exchange (callback, nullptr);
 
@@ -849,18 +1199,22 @@ public:
     // called by callbacks (possibly off the main thread)
     void deviceDetailsChanged()
     {
-        if (callbacksAllowed.get() == 1)
-            startTimer (100);
+        detailsChangePending.store (true, std::memory_order_release);
+        triggerAsyncUpdate();
     }
 
     // called by callbacks (possibly off the main thread)
     void deviceRequestedRestart()
     {
-        owner.restart();
+        restartPending.store (true, std::memory_order_release);
+        deviceListChangePending.store (true, std::memory_order_release);
         triggerAsyncUpdate();
     }
 
     bool isPlaying() const { return playing.load(); }
+
+    int getXRunCount() const noexcept { return xrunListener.getXRunCount(); }
+    void resetXRunCount() noexcept    { xrunListener.resetXRunCount(); }
 
     //==============================================================================
     struct Stream
@@ -1053,7 +1407,6 @@ public:
 
     CoreAudioIODevice& owner;
     int bitDepth = 32;
-    std::atomic<int> xruns = 0;
     Array<double> sampleRates;
     Array<int> bufferSizes;
     AudioDeviceID deviceID;
@@ -1110,11 +1463,17 @@ private:
     AudioIODeviceCallback* callback = nullptr;
     CriticalSection callbackLock;
     bool audioDeviceStopPending = false;
+    bool stoppedOnDetailsFailure = false;
     std::atomic<bool> playing { false };
     double sampleRate = 0;
     int bufferSize = 0;
     HeapBlock<float> audioBuffer;
     Atomic<int> callbacksAllowed { 1 };
+    std::atomic<bool> detailsChangePending { false };
+    std::atomic<bool> restartPending { false };
+    std::atomic<bool> deviceListChangePending { false };
+    ScopedXRunListener xrunListener;
+    ScopedAudioObjectPropertyListener propertyListener;
 
     //==============================================================================
     void timerCallback() override
@@ -1122,18 +1481,50 @@ private:
         JUCE_COREAUDIOLOG ("Device changed");
 
         stopTimer();
+
+        if (callbacksAllowed.get() != 1)
+        {
+            detailsChangePending.store (true, std::memory_order_release);
+            triggerAsyncUpdate();
+            return;
+        }
+
+        detailsChangePending.store (false, std::memory_order_release);
+        const auto restartRequested = restartPending.exchange (false, std::memory_order_acq_rel);
         auto oldSampleRate = sampleRate;
         auto oldBufferSize = bufferSize;
 
         if (! updateDetailsFromDevice())
+        {
+            if (restartRequested)
+                restartPending.store (true, std::memory_order_release);
+
+            startTimer (500);
+            stoppedOnDetailsFailure = true;
             owner.stopWithPendingCallback();
-        else if (oldBufferSize != bufferSize || ! approximatelyEqual (oldSampleRate, sampleRate))
-            owner.restart();
+        }
+        else
+        {
+            const auto restartAfterDetailsFailure = stoppedOnDetailsFailure;
+            stoppedOnDetailsFailure = false;
+
+            if (restartRequested || restartAfterDetailsFailure || oldBufferSize != bufferSize || ! approximatelyEqual (oldSampleRate, sampleRate))
+                owner.restart();
+        }
     }
 
     void handleAsyncUpdate() override
     {
-        if (owner.deviceType != nullptr)
+        if (callbacksAllowed.get() == 1)
+        {
+            if (restartPending.load (std::memory_order_acquire))
+                startTimer (0);
+            else if (detailsChangePending.load (std::memory_order_acquire))
+                startTimer (100);
+        }
+
+        if (deviceListChangePending.exchange (false, std::memory_order_acq_rel)
+             && owner.deviceType != nullptr)
             owner.deviceType->audioDeviceListChanged();
     }
 
@@ -1156,37 +1547,16 @@ private:
     {
         auto& intern = *static_cast<CoreAudioInternal*> (inClientData);
 
-        const auto xruns = std::count_if (pa, pa + numAddresses, [] (const AudioObjectPropertyAddress& x)
-        {
-            return x.mSelector == kAudioDeviceProcessorOverload;
-        });
-
-        intern.xruns += (int) xruns;
-
         const auto detailsChanged = std::any_of (pa, pa + numAddresses, [] (const AudioObjectPropertyAddress& x)
         {
-            constexpr UInt32 selectors[]
-            {
-                kAudioDevicePropertyBufferSize,
-                kAudioDevicePropertyBufferFrameSize,
-                kAudioDevicePropertyNominalSampleRate,
-                kAudioDevicePropertyStreamFormat,
-                kAudioDevicePropertyDeviceIsAlive,
-                kAudioStreamPropertyPhysicalFormat,
-            };
-
-            return std::find (std::begin (selectors), std::end (selectors), x.mSelector) != std::end (selectors);
+            return std::find (detailsChangedSelectors.begin(), detailsChangedSelectors.end(), x.mSelector)
+                != detailsChangedSelectors.end();
         });
 
         const auto requestedRestart = std::any_of (pa, pa + numAddresses, [] (const AudioObjectPropertyAddress& x)
         {
-            constexpr UInt32 selectors[]
-            {
-                kAudioDevicePropertyDeviceHasChanged,
-                kAudioObjectPropertyOwnedObjects,
-            };
-
-            return std::find (std::begin (selectors), std::end (selectors), x.mSelector) != std::end (selectors);
+            return std::find (restartSelectors.begin(), restartSelectors.end(), x.mSelector)
+                != restartSelectors.end();
         });
 
         if (detailsChanged)
@@ -1242,24 +1612,24 @@ public:
 
         jassert (internal != nullptr);
 
-        AudioObjectPropertyAddress pa;
-        pa.mSelector = kAudioObjectPropertySelectorWildcard;
-        pa.mScope    = kAudioObjectPropertyScopeWildcard;
-        pa.mElement  = kAudioObjectPropertyElementWildcard;
-
-        AudioObjectAddPropertyListener (kAudioObjectSystemObject, &pa, hardwareListenerProc, internal.get());
+        propertyListener.attach (kAudioObjectSystemObject,
+                                 std::array { AudioObjectPropertyAddress { kAudioHardwarePropertyDevices,
+                                                                           kAudioObjectPropertyScopeWildcard,
+                                                                           kAudioObjectPropertyElementWildcard } },
+                                 hardwareListenerProc,
+                                 internal.get());
     }
 
     ~CoreAudioIODevice() override
     {
+        detachPropertyListeners();
         close();
+    }
 
-        AudioObjectPropertyAddress pa;
-        pa.mSelector = kAudioObjectPropertySelectorWildcard;
-        pa.mScope = kAudioObjectPropertyScopeWildcard;
-        pa.mElement = kAudioObjectPropertyElementWildcard;
-
-        AudioObjectRemovePropertyListener (kAudioObjectSystemObject, &pa, hardwareListenerProc, internal.get());
+    void detachPropertyListeners()
+    {
+        internal->detachPropertyListener();
+        propertyListener.detach();
     }
 
     StringArray getOutputChannelNames() override        { return internal->outStream != nullptr ? internal->outStream->chanNames : StringArray(); }
@@ -1273,7 +1643,7 @@ public:
     double getCurrentSampleRate() override              { return internal->getSampleRate(); }
     int getCurrentBitDepth() override                   { return internal->bitDepth; }
     int getCurrentBufferSizeSamples() override          { return internal->getBufferSize(); }
-    int getXRunCount() const noexcept override          { return internal->xruns; }
+    int getXRunCount() const noexcept override          { return internal->getXRunCount(); }
 
     int getIndexOfDevice (bool asInput) const           { return deviceType->getDeviceNames (asInput).indexOf (getName()); }
 
@@ -1295,7 +1665,7 @@ public:
                  double sampleRate, int bufferSizeSamples) override
     {
         isOpen_ = true;
-        internal->xruns = 0;
+        internal->resetXRunCount();
 
         inputChannelsRequested = inputChannels;
         outputChannelsRequested = outputChannels;
@@ -1370,7 +1740,7 @@ public:
             deviceType->audioDeviceListChanged();
     }
 
-    // called by callbacks (possibly off the main thread)
+    // called on the message thread
     void restart()
     {
         if (restarter != nullptr)
@@ -1398,6 +1768,8 @@ public:
 
 private:
     std::unique_ptr<CoreAudioInternal> internal;
+    // Must follow internal so reverse destruction detaches before its clientData is destroyed.
+    ScopedAudioObjectPropertyListener  propertyListener;
     bool isOpen_ = false;
     String lastError;
     //  When non-null, this indicates that the device has been stopped with the intent to restart
@@ -1474,13 +1846,16 @@ public:
             lastError = TRANS ("The input and output devices don't share a common sample rate!");
     }
 
-    ~AudioIODeviceCombiner() override
-    {
-        close();
-    }
-
     auto getDeviceWrappers()       { return std::array<      DeviceWrapper*, 2> { { &inputWrapper, &outputWrapper } }; }
     auto getDeviceWrappers() const { return std::array<const DeviceWrapper*, 2> { { &inputWrapper, &outputWrapper } }; }
+
+    ~AudioIODeviceCombiner() override
+    {
+        for (auto& d : getDeviceWrappers())
+            d->detachPropertyListeners();
+
+        close();
+    }
 
     int getIndexOfDevice (bool asInput) const
     {
@@ -1585,12 +1960,18 @@ public:
 
     void close() override
     {
-        stop();
-        fifo.clear();
-        active = false;
+        JUCE_ASSERT_MESSAGE_THREAD
 
-        for (auto& d : getDeviceWrappers())
-            d->close();
+        const ScopedLock sl (closeLock);
+
+        stopTimer();
+
+        {
+            const ScopedLock sl2 (callbackLock);
+            previousCallback = nullptr;
+        }
+
+        closeInternal();
     }
 
     void restart (AudioIODeviceCallback* cb)
@@ -1609,7 +1990,11 @@ public:
             if (! approximatelyEqual (deviceSampleRate, sampleRateRequested))
             {
                 if (! getAvailableSampleRates().contains (deviceSampleRate))
+                {
+                    const ScopedLock sl2 (callbackLock);
+                    previousCallback = cb;
                     return;
+                }
 
                 for (auto& d2 : getDeviceWrappers())
                     if (&d2 != &d)
@@ -1627,7 +2012,11 @@ public:
             if (deviceBufferSize != bufferSizeRequested)
             {
                 if (! getAvailableBufferSizes().contains (deviceBufferSize))
+                {
+                    const ScopedLock sl2 (callbackLock);
+                    previousCallback = cb;
                     return;
+                }
 
                 newBufferSize = deviceBufferSize;
                 break;
@@ -1641,19 +2030,20 @@ public:
 
     void restartAsync() override
     {
-        {
-            const ScopedLock sl (closeLock);
+        const ScopedLock sl (closeLock);
 
-            if (active)
+        if (active)
+        {
             {
+                const ScopedLock sl2 (callbackLock);
+
                 if (callback != nullptr)
                     previousCallback = callback;
-
-                close();
             }
-        }
 
-        startTimer (100);
+            closeInternal();
+            startTimer (100);
+        }
     }
 
     int getOutputLatencyInSamples() override
@@ -1669,15 +2059,19 @@ public:
 
     void start (AudioIODeviceCallback* newCallback) override
     {
+        JUCE_ASSERT_MESSAGE_THREAD
+
+        const ScopedLock sl (closeLock);
+
         const auto shouldStart = [&]
         {
-            const ScopedLock sl (callbackLock);
+            const ScopedLock sl2 (callbackLock);
             return callback != newCallback;
         }();
 
         if (shouldStart)
         {
-            stop();
+            shutdown ({});
             fifo.clear();
             reset();
 
@@ -1693,12 +2087,26 @@ public:
                     lastError = TRANS ("Failed to initialise all requested devices.");
             }
 
-            const ScopedLock sl (callbackLock);
+            const ScopedLock sl2 (callbackLock);
             previousCallback = callback = newCallback;
         }
     }
 
-    void stop() override    { shutdown ({}); }
+    void stop() override
+    {
+        JUCE_ASSERT_MESSAGE_THREAD
+
+        const ScopedLock sl (closeLock);
+
+        stopTimer();
+
+        {
+            const ScopedLock sl2 (callbackLock);
+            previousCallback = nullptr;
+        }
+
+        shutdown ({});
+    }
 
     String getLastError() override
     {
@@ -1735,9 +2143,29 @@ private:
 
     void timerCallback() override
     {
+        JUCE_ASSERT_MESSAGE_THREAD
+
+        const ScopedLock sl (closeLock);
+
         stopTimer();
 
-        restart (previousCallback);
+        const auto callbackToRestart = [&]
+        {
+            const ScopedLock sl2 (callbackLock);
+            return previousCallback;
+        }();
+
+        restart (callbackToRestart);
+    }
+
+    void closeInternal()
+    {
+        shutdown ({});
+        fifo.clear();
+        active = false;
+
+        for (auto& d : getDeviceWrappers())
+            d->close();
     }
 
     void shutdown (const String& error)
@@ -2010,6 +2438,7 @@ private:
 
         ~DeviceWrapper() override
         {
+            device->setAsyncRestarter (nullptr);
             device->close();
         }
 
@@ -2054,6 +2483,11 @@ private:
         void start (AudioIODeviceCallback* callbackToNotify)      const { return device->start (callbackToNotify); }
         void stop()                                               const { return device->stop(); }
         void close()                                              const { return device->close(); }
+        void detachPropertyListeners() const
+        {
+            device->setAsyncRestarter (nullptr);
+            device->detachPropertyListeners();
+        }
         AudioWorkgroup getWorkgroup()                             const { return device->getWorkgroup(); }
 
         String open (const BigInteger& inputChannels, const BigInteger& outputChannels, double sampleRate, int bufferSizeSamples) const
@@ -2171,24 +2605,18 @@ class CoreAudioIODeviceType final : public AudioIODeviceType,
 public:
     CoreAudioIODeviceType()  : AudioIODeviceType ("CoreAudio")
     {
-        AudioObjectPropertyAddress pa;
-        pa.mSelector = kAudioHardwarePropertyDevices;
-        pa.mScope = kAudioObjectPropertyScopeWildcard;
-        pa.mElement = kAudioObjectPropertyElementWildcard;
-
-        AudioObjectAddPropertyListener (kAudioObjectSystemObject, &pa, hardwareListenerProc, this);
+        propertyListener.attach (kAudioObjectSystemObject,
+                                 std::array { AudioObjectPropertyAddress { kAudioHardwarePropertyDevices,
+                                                                           kAudioObjectPropertyScopeWildcard,
+                                                                           kAudioObjectPropertyElementWildcard } },
+                                 hardwareListenerProc,
+                                 this);
     }
 
     ~CoreAudioIODeviceType() override
     {
+        propertyListener.detach();
         cancelPendingUpdate();
-
-        AudioObjectPropertyAddress pa;
-        pa.mSelector = kAudioHardwarePropertyDevices;
-        pa.mScope = kAudioObjectPropertyScopeWildcard;
-        pa.mElement = kAudioObjectPropertyElementWildcard;
-
-        AudioObjectRemovePropertyListener (kAudioObjectSystemObject, &pa, hardwareListenerProc, this);
     }
 
     //==============================================================================
@@ -2328,6 +2756,7 @@ private:
     Array<AudioDeviceID> inputIds, outputIds;
 
     bool hasScanned = false;
+    ScopedAudioObjectPropertyListener propertyListener;
 
     void handleAsyncUpdate() override
     {
