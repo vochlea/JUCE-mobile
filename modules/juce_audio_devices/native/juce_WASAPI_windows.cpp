@@ -1433,7 +1433,7 @@ public:
 
         queue = SingleThreadedAbstractFifo (reservoirSize);
         reservoir.setSize ((size_t) (queue.getSize() * bytesPerFrame), true);
-        xruns = 0;
+        xruns.store (0, std::memory_order_relaxed);
 
         if (! check (client->Start()))
             return false;
@@ -1468,7 +1468,7 @@ public:
         while (check (captureClient->GetBuffer (&inputData, &numSamplesAvailable, &flags, nullptr, nullptr)) && numSamplesAvailable > 0)
         {
             if ((flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0)
-                xruns++;
+                xruns.fetch_add (1, std::memory_order_relaxed);
 
             if (numSamplesAvailable > (UINT32) queue.getRemainingSpace())
             {
@@ -1528,7 +1528,7 @@ public:
     ComSmartPtr<IAudioCaptureClient> captureClient;
     MemoryBlock reservoir;
     SingleThreadedAbstractFifo queue;
-    int xruns = 0;
+    std::atomic<int> xruns { 0 };
 
     std::unique_ptr<AudioData::Converter> converter;
 
@@ -1824,7 +1824,7 @@ public:
     BigInteger getActiveOutputChannels() const override     { return outputDevice != nullptr ? outputDevice->channels : BigInteger(); }
     BigInteger getActiveInputChannels() const override      { return inputDevice  != nullptr ? inputDevice->channels  : BigInteger(); }
     String getLastError() override                          { return lastError; }
-    int getXRunCount() const noexcept override              { return inputDevice != nullptr ? inputDevice->xruns : -1; }
+    int getXRunCount() const noexcept override              { return inputDevice != nullptr ? inputDevice->xruns.load (std::memory_order_relaxed) : -1; }
 
     std::optional<BigInteger> getDefaultOutputChannels() const override
     {
@@ -1907,6 +1907,13 @@ public:
 
                 if (d->probe.defaultPeriodFrames > 0)
                     return (int) d->probe.defaultPeriodFrames;
+
+                // IAudioClient3 probe periods stay zero when unavailable, so prefer the measured
+                // GetDevicePeriod default over promoting the block to the larger endpoint ring.
+                // The frame count was measured at defaultSampleRate, so rescale to the negotiated rate and never raise past the ring the client actually opened with.
+                if (d->probe.devicePeriodDefaultFrames > 0 && d->defaultSampleRate > 0)
+                    return jmin ((int) d->actualBufferSize,
+                                 roundToInt (d->probe.devicePeriodDefaultFrames * d->sampleRate / d->defaultSampleRate));
 
                 return (int) d->actualBufferSize;
             };
