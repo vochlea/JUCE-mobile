@@ -37,8 +37,10 @@ namespace juce
 
 JUCE_BEGIN_IGNORE_WARNINGS_GCC_LIKE ("-Wlanguage-extension-token")
 
+// Vochlea change: failing HRESULTs used to compile away entirely. Debug builds now
+// route them to whatever juce::Logger the application installed.
 #ifndef JUCE_WASAPI_LOGGING
- #define JUCE_WASAPI_LOGGING 0
+ #define JUCE_WASAPI_LOGGING JUCE_DEBUG
 #endif
 
 //==============================================================================
@@ -566,16 +568,27 @@ public:
         // true, initSharedStreamAttempts only ever accumulates. Without this reset a device that
         // opened low-latency once reports lowLatencyClient=1 forever, including after a later
         // open fell back to the standard client, which is the one thing the probe exists to say.
-        // rawProcessingSupported and the GetDevicePeriod pair are endpoint properties read in the
-        // constructor, not per-open results, so they survive.
+        // rawProcessingSupported, the GetDevicePeriod pair and the GetSharedModeEnginePeriod set
+        // are endpoint properties read in the constructor, not per-open results, so they survive -
+        // clearing them made a low-latency open unreadable, which is the case they exist to explain.
         {
             const auto rawSupported = probe.rawProcessingSupported;
             const auto devicePeriodMin = probe.devicePeriodMinFrames;
             const auto devicePeriodDefault = probe.devicePeriodDefaultFrames;
+            const auto enginePeriodResult = probe.sharedModeEnginePeriodResult;
+            const auto enginePeriodDefault = probe.defaultPeriodFrames;
+            const auto enginePeriodFundamental = probe.fundamentalPeriodFrames;
+            const auto enginePeriodMin = probe.minPeriodFrames;
+            const auto enginePeriodMax = probe.maxPeriodFrames;
             probe = WASAPIProbeInfo();
             probe.rawProcessingSupported = rawSupported;
             probe.devicePeriodMinFrames = devicePeriodMin;
             probe.devicePeriodDefaultFrames = devicePeriodDefault;
+            probe.sharedModeEnginePeriodResult = enginePeriodResult;
+            probe.defaultPeriodFrames = enginePeriodDefault;
+            probe.fundamentalPeriodFrames = enginePeriodFundamental;
+            probe.minPeriodFrames = enginePeriodMin;
+            probe.maxPeriodFrames = enginePeriodMax;
         }
 
         // Vochlea: same reasoning, and these two matter more than the probe fields. They latch on
@@ -732,8 +745,12 @@ private:
 
         JUCE_COMRESULT OnSessionDisconnected (AudioSessionDisconnectReason reason) override
         {
+            // Vochlea: every other reason (removal, exclusive-mode override, server
+            // shutdown, logoff) leaves a dead client the run loop would drain silently.
             if (reason == DisconnectReasonFormatChanged)
                 owner.deviceSampleRateChanged();
+            else
+                owner.deviceSessionExpired();
 
             return S_OK;
         }
@@ -1878,8 +1895,23 @@ public:
             // leg (WASAPIOutputDevice::copyBuffers chunks; the input reservoir accumulates).
             // Deliberately scoped to low-latency mode - plain shared has the same latent
             // discrepancy but no path here changed its behaviour, so it is left as it was.
-            const auto negotiated = jmax (inputDevice  != nullptr ? (int) inputDevice->actualBufferSize  : 0,
-                                          outputDevice != nullptr ? (int) outputDevice->actualBufferSize : 0);
+            // Vochlea: one engine period is what the invariant above needs. The endpoint ring is
+            // routinely wider (1056 vs 480 here), and raising to it cost 2.2x the block for nothing.
+            const auto periodFrames = [] (WASAPIDeviceBase* d) -> int
+            {
+                if (d == nullptr)
+                    return 0;
+
+                if (d->probe.currentEnginePeriodFrames > 0)
+                    return (int) d->probe.currentEnginePeriodFrames;
+
+                if (d->probe.defaultPeriodFrames > 0)
+                    return (int) d->probe.defaultPeriodFrames;
+
+                return (int) d->actualBufferSize;
+            };
+
+            const auto negotiated = jmax (periodFrames (inputDevice.get()), periodFrames (outputDevice.get()));
 
             if (negotiated > currentBufferSizeSamples)
                 currentBufferSizeSamples = negotiated;
@@ -2035,6 +2067,12 @@ public:
         ins.clear();
         outs.clear();
 
+        // Vochlea: escalate to a shutdown after ~2s of no active session rather than
+        // spinning, so the host's device recovery gets a chance to reopen the endpoint.
+        constexpr int inactivePollIntervalMs = 1;
+        constexpr int maxInactivePolls = 2000;
+        int inactivePolls = 0;
+
         while (! threadShouldExit())
         {
             if ((outputDevice != nullptr && outputDevice->shouldShutdown)
@@ -2050,7 +2088,22 @@ public:
             auto outputDeviceActive = (outputDevice != nullptr && outputDevice->isActive);
 
             if (! inputDeviceActive && ! outputDeviceActive)
+            {
+                // Vochlea: an output-only device has inputDevice == nullptr, so one inactive
+                // render session latched this into a silent unbounded spin that never recovers.
+                if (++inactivePolls > maxInactivePolls)
+                {
+                    shouldShutdown = true;
+                    triggerAsyncUpdate();
+
+                    break;
+                }
+
+                Thread::sleep (inactivePollIntervalMs);
                 continue;
+            }
+
+            inactivePolls = 0;
 
             if (inputDeviceActive)
             {
