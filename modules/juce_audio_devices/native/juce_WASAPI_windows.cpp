@@ -457,6 +457,10 @@ struct WASAPIProbeInfo
     UINT32 currentEnginePeriodFrames = 0;
     double currentEngineSampleRate = 0;
 
+    // GetDevicePeriod, i.e. the pair the shared-mode block size is actually chosen from - unlike
+    // the IAudioClient3 fields above, which stay zero on every non-low-latency open.
+    int devicePeriodMinFrames = 0, devicePeriodDefaultFrames = 0;
+
     int negotiatedBufferSize = 0;
     double negotiatedSampleRate = 0;
 
@@ -479,6 +483,8 @@ struct WASAPIProbeInfo
              + " | GetCurrentSharedModeEnginePeriod hr=" + hr (currentEnginePeriodResult)
              + " frames=" + u (currentEnginePeriodFrames)
              + " rate=" + String (currentEngineSampleRate, 0)
+             + " | GetDevicePeriod minFrames=" + String (devicePeriodMinFrames)
+             + " defaultFrames=" + String (devicePeriodDefaultFrames)
              + " | negotiated buffer=" + String (negotiatedBufferSize)
              + " rate=" + String (negotiatedSampleRate, 0);
     }
@@ -538,7 +544,11 @@ public:
 
         querySupportedBufferSizes (*format, tempClient);
         querySupportedSampleRates (*format, tempClient);
-        maxNumChannels = queryMaxNumChannels (tempClient);
+
+        // Vochlea: in shared mode IsFormatSupported queries the audio engine, which is pinned to the
+        // mix format, so the sweep cannot beat the seed above - only exclusive mode reaches a driver.
+        if (isExclusiveMode (deviceMode))
+            maxNumChannels = queryMaxNumChannels (tempClient);
     }
 
     virtual ~WASAPIDeviceBase()
@@ -556,12 +566,16 @@ public:
         // true, initSharedStreamAttempts only ever accumulates. Without this reset a device that
         // opened low-latency once reports lowLatencyClient=1 forever, including after a later
         // open fell back to the standard client, which is the one thing the probe exists to say.
-        // rawProcessingSupported is an endpoint property read in the constructor, not a per-open
-        // result, so it survives.
+        // rawProcessingSupported and the GetDevicePeriod pair are endpoint properties read in the
+        // constructor, not per-open results, so they survive.
         {
             const auto rawSupported = probe.rawProcessingSupported;
+            const auto devicePeriodMin = probe.devicePeriodMinFrames;
+            const auto devicePeriodDefault = probe.devicePeriodDefaultFrames;
             probe = WASAPIProbeInfo();
             probe.rawProcessingSupported = rawSupported;
+            probe.devicePeriodMinFrames = devicePeriodMin;
+            probe.devicePeriodDefaultFrames = devicePeriodDefault;
         }
 
         // Vochlea: same reasoning, and these two matter more than the probe fields. They latch on
@@ -931,6 +945,9 @@ private:
 
         minBufferSize = refTimeToSamples (minPeriod, defaultSampleRate);
         defaultBufferSize = refTimeToSamples (defaultPeriod, defaultSampleRate);
+
+        probe.devicePeriodMinFrames = minBufferSize;
+        probe.devicePeriodDefaultFrames = defaultBufferSize;
     }
 
     bool queryLowLatencyBufferSizes (WAVEFORMATEXTENSIBLE format, ComSmartPtr<IAudioClient>& audioClient)
