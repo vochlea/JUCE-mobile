@@ -1503,13 +1503,16 @@ public:
         }
        #endif
 
-        // Vochlea: stock preferred asio4all. It is a WDM-KS wrapper, not a vendor driver, and
-        // takes the endpoint exclusively -- system audio dies. De-preferred rather than merely
-        // un-preferred because registry order usually puts it at index 0, so falling through to
-        // `return 0` would keep the same wrong default. Still returned if it is the only driver.
+        // Vochlea: stock preferred asio4all, a WDM-KS wrapper which takes the endpoint exclusively
+        // and kills system audio; our Dubler ASIO mic driver is input-only (0 outputs). De-prefer
+        // both rather than skipping them because registry order usually puts them at index 0, so
+        // falling through to return 0 would retain the same wrong default. They are still returned
+        // if nothing else exists. Keep "Dubler ASIO" in sync with DeviceNames::dublerAsioDriverName
+        // in the app core repository's src/core/engine/iaudiodevicemanager.h.
         for (int i = startIndex; i < deviceNames.size(); ++i)
         {
-            if (! deviceNames[i].containsIgnoreCase ("asio4all"))
+            if (! deviceNames[i].containsIgnoreCase ("asio4all")
+                && ! deviceNames[i].containsIgnoreCase ("Dubler ASIO"))
             {
                 return i;
             }
