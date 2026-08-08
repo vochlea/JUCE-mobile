@@ -1604,7 +1604,14 @@ public:
             UINT32 padding = 0;
 
             if (check (client->GetCurrentPadding (&padding)))
-                return (int) actualBufferSize - (int) padding;
+            {
+                // Whatever is already queued has to drain before new audio is heard, so the queue
+                // depth we leave behind is the output latency - cap it instead of filling the ring.
+                const auto limit = queueTargetFrames > 0 ? jmin ((int) actualBufferSize, queueTargetFrames)
+                                                         : (int) actualBufferSize;
+
+                return jmax (0, limit - (int) padding);
+            }
         }
 
         return (int) actualBufferSize;
@@ -1671,9 +1678,38 @@ public:
     ComSmartPtr<IAudioRenderClient> renderClient;
     std::unique_ptr<AudioData::Converter> converter;
 
+    // Vochlea: shared-mode cap on queued frames, set once per open before the device is started.
+    // Zero keeps the stock fill-the-ring behaviour (and is what exclusive mode always uses).
+    int queueTargetFrames = 0;
+
 private:
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (WASAPIOutputDevice)
 };
+
+//==============================================================================
+/*  Vochlea: one engine period for this device, at the negotiated rate. The IAudioClient3 probe
+    periods stay zero when unavailable, so fall back to the measured GetDevicePeriod default and
+    never report more than the ring the client actually opened with.
+*/
+static constexpr double sharedModeQueueTargetSecs = 0.016;
+
+static int wasapiEnginePeriodFrames (WASAPIDeviceBase* d)
+{
+    if (d == nullptr)
+        return 0;
+
+    if (d->probe.currentEnginePeriodFrames > 0)
+        return (int) d->probe.currentEnginePeriodFrames;
+
+    if (d->probe.defaultPeriodFrames > 0)
+        return (int) d->probe.defaultPeriodFrames;
+
+    if (d->probe.devicePeriodDefaultFrames > 0 && d->defaultSampleRate > 0)
+        return jmin ((int) d->actualBufferSize,
+                     roundToInt (d->probe.devicePeriodDefaultFrames * d->sampleRate / d->defaultSampleRate));
+
+    return (int) d->actualBufferSize;
+}
 
 //==============================================================================
 class WASAPIAudioIODevice final : public AudioIODevice,
@@ -1897,31 +1933,26 @@ public:
             // discrepancy but no path here changed its behaviour, so it is left as it was.
             // Vochlea: one engine period is what the invariant above needs. The endpoint ring is
             // routinely wider (1056 vs 480 here), and raising to it cost 2.2x the block for nothing.
-            const auto periodFrames = [] (WASAPIDeviceBase* d) -> int
-            {
-                if (d == nullptr)
-                    return 0;
-
-                if (d->probe.currentEnginePeriodFrames > 0)
-                    return (int) d->probe.currentEnginePeriodFrames;
-
-                if (d->probe.defaultPeriodFrames > 0)
-                    return (int) d->probe.defaultPeriodFrames;
-
-                // IAudioClient3 probe periods stay zero when unavailable, so prefer the measured
-                // GetDevicePeriod default over promoting the block to the larger endpoint ring.
-                // The frame count was measured at defaultSampleRate, so rescale to the negotiated rate and never raise past the ring the client actually opened with.
-                if (d->probe.devicePeriodDefaultFrames > 0 && d->defaultSampleRate > 0)
-                    return jmin ((int) d->actualBufferSize,
-                                 roundToInt (d->probe.devicePeriodDefaultFrames * d->sampleRate / d->defaultSampleRate));
-
-                return (int) d->actualBufferSize;
-            };
-
-            const auto negotiated = jmax (periodFrames (inputDevice.get()), periodFrames (outputDevice.get()));
+            const auto negotiated = jmax (wasapiEnginePeriodFrames (inputDevice.get()),
+                                          wasapiEnginePeriodFrames (outputDevice.get()));
 
             if (negotiated > currentBufferSizeSamples)
                 currentBufferSizeSamples = negotiated;
+        }
+
+        // Vochlea: shared mode only - exclusive mode has no engine queue to trim and its ring IS
+        // the block. Set before the endpoint is started so start()'s silence prefill uses it too.
+        if (outputDevice != nullptr && ! isExclusiveMode (deviceMode))
+        {
+            const auto ringFrames = (int) outputDevice->actualBufferSize;
+
+            // Below one device period plus one block the ring runs dry between wakeups.
+            const auto floorFrames = jmax (1, wasapiEnginePeriodFrames (outputDevice.get()))
+                                       + jmax (1, currentBufferSizeSamples);
+
+            const auto requested = roundToInt (currentSampleRate * sharedModeQueueTargetSecs);
+
+            outputDevice->queueTargetFrames = jlimit (jmin (floorFrames, ringFrames), ringFrames, requested);
         }
 
         if (inputDevice != nullptr)   ResetEvent (inputDevice->clientEvent);
@@ -1929,6 +1960,7 @@ public:
 
         shouldShutdown = false;
         deviceSampleRateChanged = false;
+        devicesStarted.store (false, std::memory_order_release);
 
         startThread (Priority::high);
         Thread::sleep (5);
@@ -1956,6 +1988,8 @@ public:
                 return lastError;
             }
         }
+
+        devicesStarted.store (true, std::memory_order_release);
 
         isOpen_ = true;
         logProbeInfo();
@@ -2001,7 +2035,12 @@ public:
         stopThread (5000);
 
         if (inputDevice != nullptr)   inputDevice->close();
-        if (outputDevice != nullptr)  outputDevice->close();
+
+        if (outputDevice != nullptr)
+        {
+            outputDevice->queueTargetFrames = 0;
+            outputDevice->close();
+        }
 
         isOpen_ = false;
     }
@@ -2089,6 +2128,13 @@ public:
                 triggerAsyncUpdate();
 
                 break;
+            }
+
+            // Nothing may be rendered or captured until open() has started both endpoints.
+            if (! devicesStarted.load (std::memory_order_acquire))
+            {
+                Thread::sleep (1);
+                continue;
             }
 
             auto inputDeviceActive = (inputDevice != nullptr && inputDevice->isActive);
@@ -2197,6 +2243,10 @@ private:
     CriticalSection startStopLock;
 
     std::atomic<bool> shouldShutdown { false }, deviceSampleRateChanged { false };
+
+    // Vochlea: gates run() until open() has started both endpoints - the device thread is launched
+    // first, so without it a whole ring of audio is rendered into a stream that cannot drain yet.
+    std::atomic<bool> devicesStarted { false };
 
     BigInteger lastKnownInputChannels, lastKnownOutputChannels;
 

@@ -930,30 +930,38 @@ int AudioDeviceManager::chooseBestBufferSize (int bufferSize) const
 {
     jassert (currentAudioDevice != nullptr);
 
+    if (bufferSize <= 0)
+    {
+        return currentAudioDevice->getDefaultBufferSize();
+    }
+
     auto sizes = currentAudioDevice->getAvailableBufferSizes();
 
-    if (bufferSize <= 0 || sizes.isEmpty())
+    if (sizes.isEmpty())
+    {
         return currentAudioDevice->getDefaultBufferSize();
+    }
 
     if (sizes.contains (bufferSize))
+    {
         return bufferSize;
+    }
 
-    // Vochlea: snap to the nearest size at or above the request - falling back to the device
-    // default turned a saved ASIO 128 into WASAPI's 441 (10 ms) when 132 (3 ms) sat next to it.
-    int smallestAbove = 0, largest = 0;
+    // Vochlea: snap to the nearest size at or above the request; requests above all available
+    // sizes fall back to the device default.
+    int smallestAbove = 0;
 
     for (int i = sizes.size(); --i >= 0;)
     {
         auto size = sizes[i];
 
-        if (size > largest)
-            largest = size;
-
         if (size >= bufferSize && (smallestAbove == 0 || size < smallestAbove))
+        {
             smallestAbove = size;
+        }
     }
 
-    return smallestAbove > 0 ? smallestAbove : largest;
+    return smallestAbove > 0 ? smallestAbove : currentAudioDevice->getDefaultBufferSize();
 }
 
 void AudioDeviceManager::stopDevice()
