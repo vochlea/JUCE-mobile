@@ -682,6 +682,8 @@ public:
     String getLastError() override           { return error; }
     bool hasControlPanel() const override    { return true; }
 
+    bool isInsideDeviceReset() const noexcept override    { return insideResetCallback; }
+
     bool showControlPanel() override
     {
         JUCE_ASIO_LOG ("showing control panel");
@@ -719,6 +721,13 @@ public:
         {
             stopTimer();
             JUCE_ASIO_LOG ("restart request!");
+
+            /*  Vochlea: open() below pumps the message queue, so anything watching this device
+                can be dispatched while it is transiently closed. Without this latch the device
+                is indistinguishable from one that died, and a watchdog that reacts by deleting
+                it frees the object this frame is still running on.
+            */
+            const ScopedValueSetter<bool> resetting (insideResetCallback, true);
 
             auto* oldCallback = currentCallback;
             close();
@@ -775,6 +784,7 @@ private:
     std::atomic<bool> calledback { false };
     bool postOutput = true, needToReset = false;
     bool insideControlPanelModalLoop = false;
+    bool insideResetCallback = false;
     bool shouldUsePreferredSize = false;
     int xruns = 0;
 
@@ -1483,17 +1493,32 @@ public:
     {
         jassert (hasScanned); // need to call scanForDevices() before doing this
 
-        for (int i = deviceNames.size(); --i >= 0;)
-            if (deviceNames[i].containsIgnoreCase ("asio4all"))
-                return i; // asio4all is a safe choice for a default..
+        auto startIndex = 0;
 
        #if JUCE_DEBUG
         if (deviceNames.size() > 1 && deviceNames[0].containsIgnoreCase ("digidesign"))
-            return 1; // (the digi m-box driver crashes the app when you run
-                      // it in the debugger, which can be a bit annoying)
+        {
+            startIndex = 1; // (the digi m-box driver crashes the app when you run
+                            // it in the debugger, which can be a bit annoying)
+        }
        #endif
 
-        return 0;
+        // Vochlea: stock preferred asio4all, a WDM-KS wrapper which takes the endpoint exclusively
+        // and kills system audio; our Dubler ASIO mic driver is input-only (0 outputs). De-prefer
+        // both rather than skipping them because registry order usually puts them at index 0, so
+        // falling through to return 0 would retain the same wrong default. They are still returned
+        // if nothing else exists. Keep "Dubler ASIO" in sync with DeviceNames::dublerAsioDriverName
+        // in the app core repository's src/core/engine/iaudiodevicemanager.h.
+        for (int i = startIndex; i < deviceNames.size(); ++i)
+        {
+            if (! deviceNames[i].containsIgnoreCase ("asio4all")
+                && ! deviceNames[i].containsIgnoreCase ("Dubler ASIO"))
+            {
+                return i;
+            }
+        }
+
+        return startIndex;
     }
 
     static int findFreeSlot()

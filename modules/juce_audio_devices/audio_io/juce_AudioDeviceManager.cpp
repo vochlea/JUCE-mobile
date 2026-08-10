@@ -521,6 +521,64 @@ void AudioDeviceManager::insertDefaultDeviceNames (AudioDeviceSetup& setup) cons
 
     if (auto* type = getCurrentDeviceTypeObject())
     {
+        if (! type->hasSeparateInputsAndOutputs())
+        {
+            const bool needOut = numOutputChansNeeded > 0 && setup.outputDeviceName.isEmpty();
+            const bool needIn  = numInputChansNeeded  > 0 && setup.inputDeviceName.isEmpty();
+
+            if (! needOut && ! needIn)
+            {
+                return;
+            }
+
+            auto devicesToTest = type->getDeviceNames();
+            devicesToTest.move (type->getDefaultDeviceIndex (needIn && ! needOut), 0);
+
+            // Vochlea: unified devices are tested once per candidate because cross-name pairs are meaningless
+            // and some drivers are pathologically slow to construct. Candidates must provide the still-unnamed
+            // requested directions, and preset device names are never overwritten.
+            if (devicesToTest.size() > 1)
+            {
+                for (const auto& name : devicesToTest)
+                {
+                    auto device = rawToUniquePtr (type->createDevice (name, name));
+
+                    if (device != nullptr
+                        && ! device->getAvailableSampleRates().isEmpty()
+                        && (! needOut || ! device->getOutputChannelNames().isEmpty())
+                        && (! needIn  || ! device->getInputChannelNames().isEmpty()))
+                    {
+                        if (needOut)
+                        {
+                            setup.outputDeviceName = name;
+                        }
+
+                        if (needIn)
+                        {
+                            setup.inputDeviceName = name;
+                        }
+
+                        return;
+                    }
+                }
+            }
+
+            if (! devicesToTest.isEmpty())
+            {
+                if (needOut)
+                {
+                    setup.outputDeviceName = devicesToTest[0];
+                }
+
+                if (needIn)
+                {
+                    setup.inputDeviceName = devicesToTest[0];
+                }
+            }
+
+            return;
+        }
+
         // We avoid selecting a device pair that doesn't share a matching sample rate, if possible.
         // If not, other parts of the AudioDeviceManager and AudioIODevice classes should generate
         // an appropriate error message when opening or starting these devices.
@@ -872,10 +930,38 @@ int AudioDeviceManager::chooseBestBufferSize (int bufferSize) const
 {
     jassert (currentAudioDevice != nullptr);
 
-    if (bufferSize > 0 && currentAudioDevice->getAvailableBufferSizes().contains (bufferSize))
-        return bufferSize;
+    if (bufferSize <= 0)
+    {
+        return currentAudioDevice->getDefaultBufferSize();
+    }
 
-    return currentAudioDevice->getDefaultBufferSize();
+    auto sizes = currentAudioDevice->getAvailableBufferSizes();
+
+    if (sizes.isEmpty())
+    {
+        return currentAudioDevice->getDefaultBufferSize();
+    }
+
+    if (sizes.contains (bufferSize))
+    {
+        return bufferSize;
+    }
+
+    // Vochlea: snap to the nearest size at or above the request; requests above all available
+    // sizes fall back to the device default.
+    int smallestAbove = 0;
+
+    for (int i = sizes.size(); --i >= 0;)
+    {
+        auto size = sizes[i];
+
+        if (size >= bufferSize && (smallestAbove == 0 || size < smallestAbove))
+        {
+            smallestAbove = size;
+        }
+    }
+
+    return smallestAbove > 0 ? smallestAbove : currentAudioDevice->getDefaultBufferSize();
 }
 
 void AudioDeviceManager::stopDevice()

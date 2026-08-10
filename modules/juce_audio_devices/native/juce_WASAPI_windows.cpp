@@ -37,8 +37,10 @@ namespace juce
 
 JUCE_BEGIN_IGNORE_WARNINGS_GCC_LIKE ("-Wlanguage-extension-token")
 
+// Vochlea change: failing HRESULTs used to compile away entirely. Debug builds now
+// route them to whatever juce::Logger the application installed.
 #ifndef JUCE_WASAPI_LOGGING
- #define JUCE_WASAPI_LOGGING 0
+ #define JUCE_WASAPI_LOGGING JUCE_DEBUG
 #endif
 
 //==============================================================================
@@ -89,6 +91,8 @@ static void logFailure ([[maybe_unused]] HRESULT hr)
             JUCE_WASAPI_ERR (AUDCLNT_E_BUFFER_ERROR, 0x018)
             JUCE_WASAPI_ERR (AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED, 0x019)
             JUCE_WASAPI_ERR (AUDCLNT_E_INVALID_DEVICE_PERIOD, 0x020)
+            JUCE_WASAPI_ERR (AUDCLNT_E_ENGINE_PERIODICITY_LOCKED, 0x028)
+            JUCE_WASAPI_ERR (AUDCLNT_E_ENGINE_FORMAT_LOCKED, 0x029)
             default: break;
         }
 
@@ -203,6 +207,16 @@ enum AUDCLNT_SHAREMODE
     AUDCLNT_SHAREMODE_EXCLUSIVE
 };
 
+// Vochlea addition: stream options, Windows 8.1+. RAW opts the stream out of the endpoint's
+// APO chain - on Win11 24H2+ that chain includes Voice Focus / Windows Studio Effects, which
+// adaptively reshape exactly the transients and spectra an onset/MFCC detector measures.
+enum AUDCLNT_STREAMOPTIONS
+{
+    AUDCLNT_STREAMOPTIONS_NONE         = 0x00,
+    AUDCLNT_STREAMOPTIONS_RAW          = 0x01,
+    AUDCLNT_STREAMOPTIONS_MATCH_FORMAT = 0x02
+};
+
 enum AUDIO_STREAM_CATEGORY
 {
     AudioCategory_Other = 0,
@@ -224,6 +238,7 @@ struct AudioClientProperties
     UINT32                  cbSize;
     BOOL                    bIsOffload;
     AUDIO_STREAM_CATEGORY   eCategory;
+    AUDCLNT_STREAMOPTIONS   Options; // Vochlea addition: present in the Windows 8.1+ struct
 };
 
 JUCE_IUNKNOWNCLASS (IAudioClient, "1CB9AD4C-DBFA-4c32-B178-C2F568A703B2")
@@ -249,7 +264,11 @@ JUCE_COMCLASS (IAudioClient2, "726778CD-F60A-4eda-82DE-E47610CD78AA") : public I
     JUCE_COMCALL GetBufferSizeLimits (const WAVEFORMATEX*, BOOL, REFERENCE_TIME*, REFERENCE_TIME*) = 0;
 };
 
-JUCE_COMCLASS (IAudioClient3, "1CB9AD4C-DBFA-4c32-B178-C2F568A703B2") : public IAudioClient2
+// Vochlea fix: stock JUCE 8.0.6 declares IAudioClient3 with IAudioClient's IID (both here and
+// in the __CRT_UUID_DECL below). QueryInterface for it therefore always succeeded, handed back
+// a plain IAudioClient, and the IAudioClient3 methods were called through vtable slots the
+// object may not have. Real IID per the Windows SDK's audioclient.h.
+JUCE_COMCLASS (IAudioClient3, "7ED4EE07-8E67-4CD4-8C1A-2B7A5987AD42") : public IAudioClient2
 {
     JUCE_COMCALL GetSharedModeEnginePeriod (const WAVEFORMATEX*, UINT32*, UINT32*, UINT32*, UINT32*) = 0;
     JUCE_COMCALL GetCurrentSharedModeEnginePeriod (WAVEFORMATEX**, UINT32*) = 0;
@@ -343,7 +362,7 @@ __CRT_UUID_DECL (juce::IMMDeviceEnumerator,   0xA95664D2, 0x9614, 0x4F35, 0xA7, 
 __CRT_UUID_DECL (juce::MMDeviceEnumerator,    0xBCDE0395, 0xE52F, 0x467C, 0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E)
 __CRT_UUID_DECL (juce::IAudioClient,          0x1CB9AD4C, 0xDBFA, 0x4c32, 0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2)
 __CRT_UUID_DECL (juce::IAudioClient2,         0x726778CD, 0xF60A, 0x4eda, 0x82, 0xDE, 0xE4, 0x76, 0x10, 0xCD, 0x78, 0xAA)
-__CRT_UUID_DECL (juce::IAudioClient3,         0x1CB9AD4C, 0xDBFA, 0x4c32, 0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2)
+__CRT_UUID_DECL (juce::IAudioClient3,         0x7ED4EE07, 0x8E67, 0x4CD4, 0x8C, 0x1A, 0x2B, 0x7A, 0x59, 0x87, 0xAD, 0x42) // Vochlea fix, see above
 __CRT_UUID_DECL (juce::IAudioCaptureClient,   0xC8ADBD64, 0xE71E, 0x48a0, 0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17)
 __CRT_UUID_DECL (juce::IAudioRenderClient,    0xF294ACFC, 0x3146, 0x4483, 0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2)
 __CRT_UUID_DECL (juce::IAudioEndpointVolume,  0x5CDF2C82, 0x841E, 0x4546, 0x97, 0x22, 0x0C, 0xF7, 0x40, 0x78, 0x22, 0x9A)
@@ -412,16 +431,101 @@ static bool supportsSampleRateConversion (WASAPIDeviceMode deviceMode) noexcept
 }
 
 //==============================================================================
+/*  Vochlea addition: what WASAPI actually negotiated for one endpoint.
+
+    Stock JUCE reports none of this, so a silent fallback - no IAudioClient3, an engine period
+    already locked by another process, a driver that only offers 10ms periods - is
+    indistinguishable from a device that opened exactly as asked. Captured per opened device and
+    reachable from outside this file through the process-wide juce::getLastWASAPIProbeReport()
+    snapshot at the end of it - deliberately the only route out, since neither this struct nor
+    WASAPIAudioIODevice is declared in any public JUCE header.
+
+    An unset optional means the call was never made, which is a different fact from the call
+    having failed.
+*/
+struct WASAPIProbeInfo
+{
+    bool hasAudioClient3 = false;
+    bool rawProcessingSupported = false;
+    bool rawProcessingEnabled = false;
+    bool usedLowLatencyClient = false;
+
+    std::optional<HRESULT> sharedModeEnginePeriodResult;
+    UINT32 defaultPeriodFrames = 0, fundamentalPeriodFrames = 0, minPeriodFrames = 0, maxPeriodFrames = 0;
+
+    std::optional<HRESULT> initSharedStreamResult; // the final attempt's result
+    int initSharedStreamAttempts = 0;              // > 1 means we hit a locked engine and retried
+    std::optional<HRESULT> currentEnginePeriodResult;
+    UINT32 currentEnginePeriodFrames = 0;
+    double currentEngineSampleRate = 0;
+
+    // GetDevicePeriod, i.e. the pair the shared-mode block size is actually chosen from - unlike
+    // the IAudioClient3 fields above, which stay zero on every non-low-latency open.
+    int devicePeriodMinFrames = 0, devicePeriodDefaultFrames = 0;
+
+    int negotiatedBufferSize = 0;
+    double negotiatedSampleRate = 0;
+
+    String toString() const
+    {
+        auto hr = [] (const std::optional<HRESULT>& r) { return r.has_value() ? String::toHexString ((int) *r) : String ("n/a"); };
+        auto u  = [] (UINT32 v)                        { return String ((int) v); };
+
+        return "audioClient3=" + String ((int) hasAudioClient3)
+             + " rawSupported=" + String ((int) rawProcessingSupported)
+             + " rawEnabled=" + String ((int) rawProcessingEnabled)
+             + " lowLatencyClient=" + String ((int) usedLowLatencyClient)
+             + " | GetSharedModeEnginePeriod hr=" + hr (sharedModeEnginePeriodResult)
+             + " default=" + u (defaultPeriodFrames)
+             + " fundamental=" + u (fundamentalPeriodFrames)
+             + " min=" + u (minPeriodFrames)
+             + " max=" + u (maxPeriodFrames)
+             + " | InitializeSharedAudioStream hr=" + hr (initSharedStreamResult)
+             + " attempts=" + String (initSharedStreamAttempts)
+             + " | GetCurrentSharedModeEnginePeriod hr=" + hr (currentEnginePeriodResult)
+             + " frames=" + u (currentEnginePeriodFrames)
+             + " rate=" + String (currentEngineSampleRate, 0)
+             + " | GetDevicePeriod minFrames=" + String (devicePeriodMinFrames)
+             + " defaultFrames=" + String (devicePeriodDefaultFrames)
+             + " | negotiated buffer=" + String (negotiatedBufferSize)
+             + " rate=" + String (negotiatedSampleRate, 0);
+    }
+};
+
+static CriticalSection& getLastProbeReportLock()
+{
+    static CriticalSection lock;
+    return lock;
+}
+
+static String& getLastProbeReportRef()
+{
+    static String report;
+    return report;
+}
+
+//==============================================================================
 class WASAPIDeviceBase
 {
 public:
-    WASAPIDeviceBase (const ComSmartPtr<IMMDevice>& d, WASAPIDeviceMode mode)
+    WASAPIDeviceBase (const ComSmartPtr<IMMDevice>& d, WASAPIDeviceMode mode, bool isCapture)
         : device (d),
-          deviceMode (mode)
+          deviceMode (mode),
+          isCaptureEndpoint (isCapture)
     {
         clientEvent = CreateEvent (nullptr, false, false, nullptr);
 
-        ComSmartPtr<IAudioClient> tempClient (createClient());
+        // Vochlea: an endpoint property, read once here - it gates setRawStreamOptions().
+        probe.rawProcessingSupported = isRawProcessingSupported (device);
+
+        // Vochlea: enumeration must NOT run on a raw client. RAW bypasses the capture APO chain,
+        // which is precisely what changes the channel count and the sample rate on array mics
+        // (4ch raw vs 1ch post-array; some raw streams are 16kHz). Measured on a raw client, the
+        // mix format, buffer sizes, rates and channel count below would describe a stream the
+        // device may never be opened with - and, worse than a failure to open, it would then open
+        // cleanly at the wrong format with nothing downstream able to tell. Stream options are
+        // applied only to the client openClient() actually opens.
+        ComSmartPtr<IAudioClient> tempClient (createClient (false));
 
         if (tempClient == nullptr)
             return;
@@ -442,7 +546,11 @@ public:
 
         querySupportedBufferSizes (*format, tempClient);
         querySupportedSampleRates (*format, tempClient);
-        maxNumChannels = queryMaxNumChannels (tempClient);
+
+        // Vochlea: in shared mode IsFormatSupported queries the audio engine, which is pinned to the
+        // mix format, so the sweep cannot beat the seed above - only exclusive mode reaches a driver.
+        if (isExclusiveMode (deviceMode))
+            maxNumChannels = queryMaxNumChannels (tempClient);
     }
 
     virtual ~WASAPIDeviceBase()
@@ -455,6 +563,41 @@ public:
 
     bool openClient (const double newSampleRate, const BigInteger& newChannels, const int bufferSizeSamples)
     {
+        // Vochlea: WASAPIAudioIODevice::open() reuses this object across reopens, and every probe
+        // field below is a per-open negotiation result - usedLowLatencyClient is only ever set
+        // true, initSharedStreamAttempts only ever accumulates. Without this reset a device that
+        // opened low-latency once reports lowLatencyClient=1 forever, including after a later
+        // open fell back to the standard client, which is the one thing the probe exists to say.
+        // rawProcessingSupported, the GetDevicePeriod pair and the GetSharedModeEnginePeriod set
+        // are endpoint properties read in the constructor, not per-open results, so they survive -
+        // clearing them made a low-latency open unreadable, which is the case they exist to explain.
+        {
+            const auto rawSupported = probe.rawProcessingSupported;
+            const auto devicePeriodMin = probe.devicePeriodMinFrames;
+            const auto devicePeriodDefault = probe.devicePeriodDefaultFrames;
+            const auto enginePeriodResult = probe.sharedModeEnginePeriodResult;
+            const auto enginePeriodDefault = probe.defaultPeriodFrames;
+            const auto enginePeriodFundamental = probe.fundamentalPeriodFrames;
+            const auto enginePeriodMin = probe.minPeriodFrames;
+            const auto enginePeriodMax = probe.maxPeriodFrames;
+            probe = WASAPIProbeInfo();
+            probe.rawProcessingSupported = rawSupported;
+            probe.devicePeriodMinFrames = devicePeriodMin;
+            probe.devicePeriodDefaultFrames = devicePeriodDefault;
+            probe.sharedModeEnginePeriodResult = enginePeriodResult;
+            probe.defaultPeriodFrames = enginePeriodDefault;
+            probe.fundamentalPeriodFrames = enginePeriodFundamental;
+            probe.minPeriodFrames = enginePeriodMin;
+            probe.maxPeriodFrames = enginePeriodMax;
+        }
+
+        // Vochlea: same reasoning, and these two matter more than the probe fields. They latch on
+        // a transient refusal - a DAW holding the engine format for a moment - and are never
+        // cleared, so without this one such moment disables the APO bypass this patch exists for
+        // on every later reopen of this object, silently.
+        matchFormatDisabled = false;
+        rawStreamOptionsDisabled = false;
+
         sampleRate = newSampleRate;
         channels = newChannels;
         channels.setRange (maxNumChannels, channels.getHighestBit() + 1 - maxNumChannels, false);
@@ -471,6 +614,14 @@ public:
             sampleRateHasChanged = false;
             shouldShutdown = false;
 
+            // Vochlea: these indices come from maxNumChannels, measured during enumeration, while
+            // actualNumChannels comes from the format the open actually negotiated - in shared mode
+            // findSupportedFormat() accepts the engine's "nearest" format, which can carry fewer
+            // channels. So an index here can exceed the real frame, and convertSamples bounds-checks
+            // nothing on the audio thread. Left UNCLAMPED deliberately: the entry means a SOURCE
+            // channel to the capture consumer and a DESTINATION channel to the render one, so a
+            // single clamp cannot be right for both - clamping the render side silently collapses
+            // two sources onto one channel and leaves another unwritten. Each consumer bounds it.
             channelMaps.clear();
 
             for (int i = 0; i <= channels.getHighestBit(); ++i)
@@ -483,6 +634,11 @@ public:
                 latencySamples = refTimeToSamples (latency, sampleRate);
 
             (void) check (client->GetBufferSize (&actualBufferSize));
+
+            probe.negotiatedBufferSize = (int) actualBufferSize;
+            probe.negotiatedSampleRate = sampleRate;
+            queryCurrentEnginePeriod();
+
             createSessionEventCallback();
             return check (client->SetEventHandle (clientEvent));
         }
@@ -539,6 +695,7 @@ public:
     ComSmartPtr<IAudioClient> client;
 
     WASAPIDeviceMode deviceMode;
+    const bool isCaptureEndpoint; // Vochlea addition: RAW is a capture-side decision only
 
     double sampleRate = 0, defaultSampleRate = 0;
     int numChannels = 0, actualNumChannels = 0, maxNumChannels = 0, defaultNumChannels = 0;
@@ -552,6 +709,7 @@ public:
     UINT32 actualBufferSize = 0;
     int bytesPerSample = 0, bytesPerFrame = 0;
     std::atomic<bool> sampleRateHasChanged { false }, shouldShutdown { false }, isActive { true };
+    WASAPIProbeInfo probe; // Vochlea addition
 
     virtual void updateFormat (bool isFloat) = 0;
 
@@ -587,8 +745,12 @@ private:
 
         JUCE_COMRESULT OnSessionDisconnected (AudioSessionDisconnectReason reason) override
         {
+            // Vochlea: every other reason (removal, exclusive-mode override, server
+            // shutdown, logoff) leaves a dead client the run loop would drain silently.
             if (reason == DisconnectReasonFormatChanged)
                 owner.deviceSampleRateChanged();
+            else
+                owner.deviceSessionExpired();
 
             return S_OK;
         }
@@ -599,6 +761,19 @@ private:
 
     ComSmartPtr<IAudioSessionControl> audioSessionControl;
     ComSmartPtr<SessionEventCallback> sessionEventCallback;
+
+    // Vochlea: latch once this endpoint has proved it cannot open with the corresponding
+    // stream option. MATCH_FORMAT is dropped first (it is the option that provokes both
+    // AUDCLNT_E_ENGINE_FORMAT_LOCKED and _PERIODICITY_LOCKED); RAW is only ever dropped as a
+    // last resort.
+    bool matchFormatDisabled = false, rawStreamOptionsDisabled = false;
+
+    // Vochlea: whether the client currently held by `client` was configured with stream options,
+    // maintained by setRawStreamOptions() alone. Deliberately NOT read back out of the probe:
+    // probe.rawProcessingEnabled records the last SetClientProperties *result* and is left
+    // untouched by that function's early returns, so an intermediate failure there would silently
+    // disable the raw-drop retry below.
+    bool rawStreamOptionsRequested = false;
 
     void createSessionEventCallback()
     {
@@ -623,7 +798,7 @@ private:
     }
 
     //==============================================================================
-    ComSmartPtr<IAudioClient> createClient()
+    ComSmartPtr<IAudioClient> createClient (bool applyStreamOptions = true)
     {
         ComSmartPtr<IAudioClient> newClient;
 
@@ -631,7 +806,128 @@ private:
             logFailure (device->Activate (__uuidof (IAudioClient), CLSCTX_INPROC_SERVER,
                                           nullptr, (void**) newClient.resetAndGetPointerAddress()));
 
+        // Vochlea: applied here rather than at the call sites so that every client we intend to
+        // OPEN - the one openClient() creates, and the ones recreated by the alignment dance, the
+        // locked-engine retry and the raw-drop retry - carries the same stream options. The
+        // constructor's enumeration client passes false; see the note there. If this fails the
+        // stream simply opens processed, as it did before.
+        if (applyStreamOptions && newClient != nullptr)
+            setRawStreamOptions (newClient);
+
         return newClient;
+    }
+
+    /*  Vochlea: RawProcessingSupported is an endpoint property, not something IAudioClient
+        exposes, so it has to be read off the IMMDevice's property store. Absent property or
+        any failure => treated as unsupported, i.e. today's behaviour.
+    */
+    static bool isRawProcessingSupported (const ComSmartPtr<IMMDevice>& d)
+    {
+        if (d == nullptr)
+            return false;
+
+        ComSmartPtr<IPropertyStore> properties;
+
+        if (! check (d->OpenPropertyStore (STGM_READ, properties.resetAndGetPointerAddress())))
+            return false;
+
+        // PKEY_Devices_AudioDevice_RawProcessingSupported
+        const PROPERTYKEY rawProcessingSupportedKey
+            = { { 0x8943b373, 0x388c, 0x4395, { 0xb5, 0x57, 0xbc, 0x6d, 0xba, 0xff, 0xaf, 0xdb } }, 2 };
+
+        PROPVARIANT value;
+        zerostruct (value);
+
+        auto result = false;
+
+        if (check (properties->GetValue (rawProcessingSupportedKey, &value)))
+        {
+            // The device-property type is DEVPROP_TYPE_BOOLEAN, which surfaces through
+            // IPropertyStore as one of several variant types depending on the Windows build.
+            switch (value.vt)
+            {
+                case VT_BOOL: result = value.boolVal != 0; break;
+                case VT_UI1:  result = value.bVal    != 0; break;
+                case VT_UI4:  result = value.ulVal   != 0; break;
+                case VT_I4:   result = value.lVal    != 0; break;
+                default:      break;
+            }
+        }
+
+        PropVariantClear (&value);
+        return result;
+    }
+
+    void setRawStreamOptions (ComSmartPtr<IAudioClient>& clientToUse)
+    {
+        // Always describes the client passed in, never an older one - the raw-drop retry below
+        // reads it back and must not act on a stale value.
+        rawStreamOptionsRequested = false;
+
+        // Vochlea: RAW is a capture-side decision. Its entire motive is detector accuracy, which
+        // is a property of the input signal; on a render endpoint it would instead bypass speaker
+        // EQ, bass management, loudness and speaker protection - user-visible cost, no benefit.
+        if (! isCaptureEndpoint
+             || ! probe.rawProcessingSupported
+             || isExclusiveMode (deviceMode)
+             || rawStreamOptionsDisabled)
+            return;
+
+        auto audioClient2 = clientToUse.getInterface<IAudioClient2>();
+
+        if (audioClient2 == nullptr)
+            return;
+
+        AudioClientProperties properties;
+        zerostruct (properties);
+
+        properties.cbSize     = (UINT32) sizeof (properties);
+        properties.bIsOffload = FALSE;
+        properties.eCategory  = AudioCategory_Other;
+
+        // MATCH_FORMAT asks the engine to adopt the format we are about to request instead of
+        // resampling us into its own. It is only requested on the low-latency path, because that
+        // is the only path below that knows how to recover from the two errors it provokes -
+        // AUDCLNT_E_ENGINE_FORMAT_LOCKED / _PERIODICITY_LOCKED - when another process already owns
+        // the engine.
+        properties.Options = (isLowLatencyMode (deviceMode) && ! matchFormatDisabled)
+                                 ? (AUDCLNT_STREAMOPTIONS) (AUDCLNT_STREAMOPTIONS_RAW | AUDCLNT_STREAMOPTIONS_MATCH_FORMAT)
+                                 : AUDCLNT_STREAMOPTIONS_RAW;
+
+        // Only true if the call actually took: Win8.0 rejects this cbSize and some drivers return
+        // E_NOTIMPL. Claiming otherwise would send an unrelated open failure down the raw-drop
+        // retry, wasting an Activate and latching RAW off on a machine that never applied it.
+        probe.rawProcessingEnabled = check (audioClient2->SetClientProperties (&properties));
+        rawStreamOptionsRequested = probe.rawProcessingEnabled;
+    }
+
+    void queryCurrentEnginePeriod()
+    {
+        if (client == nullptr || isExclusiveMode (deviceMode))
+            return;
+
+        auto audioClient3 = client.getInterface<IAudioClient3>();
+        probe.hasAudioClient3 = (audioClient3 != nullptr);
+
+        if (audioClient3 == nullptr)
+            return;
+
+        WAVEFORMATEX* currentFormat = nullptr;
+        UINT32 currentPeriod = 0;
+
+        auto hr = audioClient3->GetCurrentSharedModeEnginePeriod (&currentFormat, &currentPeriod);
+        probe.currentEnginePeriodResult = hr;
+        logFailure (hr);
+
+        if (SUCCEEDED (hr))
+        {
+            probe.currentEnginePeriodFrames = currentPeriod;
+
+            if (currentFormat != nullptr)
+                probe.currentEngineSampleRate = (double) currentFormat->nSamplesPerSec;
+        }
+
+        CoTaskMemFree (currentFormat);
     }
 
     static std::optional<WAVEFORMATEXTENSIBLE> getClientMixFormat (ComSmartPtr<IAudioClient>& client)
@@ -652,35 +948,63 @@ private:
     //==============================================================================
     void querySupportedBufferSizes (WAVEFORMATEXTENSIBLE format, ComSmartPtr<IAudioClient>& audioClient)
     {
-        if (isLowLatencyMode (deviceMode))
-        {
-            if (auto audioClient3 = audioClient.getInterface<IAudioClient3>())
-            {
-                UINT32 defaultPeriod = 0, fundamentalPeriod = 0, minPeriod = 0, maxPeriod = 0;
+        // Vochlea: the low-latency query is now allowed to fail. Stock JUCE left every buffer
+        // size at zero when the IAudioClient3 QI or the period query failed, which makes
+        // isOk() false and the device unopenable - a driver without IAudioClient3 has to
+        // degrade to the standard period, not disappear.
+        if (isLowLatencyMode (deviceMode) && queryLowLatencyBufferSizes (format, audioClient))
+            return;
 
-                if (check (audioClient3->GetSharedModeEnginePeriod ((WAVEFORMATEX*) &format,
-                                                                    &defaultPeriod,
-                                                                    &fundamentalPeriod,
-                                                                    &minPeriod,
-                                                                    &maxPeriod)))
-                {
-                    minBufferSize = (int) minPeriod;
-                    defaultBufferSize = (int) defaultPeriod;
-                    lowLatencyMaxBufferSize = (int) maxPeriod;
-                    lowLatencyBufferSizeMultiple = (int) fundamentalPeriod;
-                }
-            }
-        }
-        else
-        {
-            REFERENCE_TIME defaultPeriod, minPeriod;
+        REFERENCE_TIME defaultPeriod, minPeriod;
 
-            if (! check (audioClient->GetDevicePeriod (&defaultPeriod, &minPeriod)))
-                return;
+        if (! check (audioClient->GetDevicePeriod (&defaultPeriod, &minPeriod)))
+            return;
 
-            minBufferSize = refTimeToSamples (minPeriod, defaultSampleRate);
-            defaultBufferSize = refTimeToSamples (defaultPeriod, defaultSampleRate);
-        }
+        minBufferSize = refTimeToSamples (minPeriod, defaultSampleRate);
+        defaultBufferSize = refTimeToSamples (defaultPeriod, defaultSampleRate);
+
+        probe.devicePeriodMinFrames = minBufferSize;
+        probe.devicePeriodDefaultFrames = defaultBufferSize;
+    }
+
+    bool queryLowLatencyBufferSizes (WAVEFORMATEXTENSIBLE format, ComSmartPtr<IAudioClient>& audioClient)
+    {
+        auto audioClient3 = audioClient.getInterface<IAudioClient3>();
+        probe.hasAudioClient3 = (audioClient3 != nullptr);
+
+        if (audioClient3 == nullptr)
+            return false;
+
+        UINT32 defaultPeriod = 0, fundamentalPeriod = 0, minPeriod = 0, maxPeriod = 0;
+
+        auto hr = audioClient3->GetSharedModeEnginePeriod ((WAVEFORMATEX*) &format,
+                                                           &defaultPeriod,
+                                                           &fundamentalPeriod,
+                                                           &minPeriod,
+                                                           &maxPeriod);
+        probe.sharedModeEnginePeriodResult = hr;
+        logFailure (hr);
+
+        if (FAILED (hr))
+            return false;
+
+        probe.defaultPeriodFrames     = defaultPeriod;
+        probe.fundamentalPeriodFrames = fundamentalPeriod;
+        probe.minPeriodFrames         = minPeriod;
+        probe.maxPeriodFrames         = maxPeriod;
+
+        // A zero fundamental period would make the buffer-size enumeration in
+        // WASAPIAudioIODevice::initialise() spin forever, and zero periods are not usable
+        // sizes - treat any of them as "this driver cannot do low latency".
+        if (defaultPeriod == 0 || minPeriod == 0 || fundamentalPeriod == 0 || maxPeriod == 0)
+            return false;
+
+        minBufferSize = (int) minPeriod;
+        defaultBufferSize = (int) defaultPeriod;
+        lowLatencyMaxBufferSize = (int) maxPeriod;
+        lowLatencyBufferSizeMultiple = (int) fundamentalPeriod;
+
+        return true;
     }
 
     void querySupportedSampleRates (WAVEFORMATEXTENSIBLE format, ComSmartPtr<IAudioClient>& audioClient)
@@ -840,13 +1164,112 @@ private:
         return streamFlags;
     }
 
+    /*  Vochlea: the shared engine period and format are global per endpoint. If a DAW, a
+        browser or Discord got there first, InitializeSharedAudioStream fails with
+        AUDCLNT_E_ENGINE_PERIODICITY_LOCKED / _FORMAT_LOCKED and stock JUCE gives up, which
+        (with no fallback at the call site) means the device does not open at all. Retry on
+        the incumbent's terms instead, asking the engine what those terms actually are rather
+        than guessing.
+
+        Note what this deliberately does NOT do: adopt the engine's format. findSupportedFormat
+        guarantees the format has at least numChannels channels and a container updateFormat
+        can convert; an engine format satisfies neither, and channelMaps is built from the
+        requested channels afterwards, so adopting one can index past the end of a frame. The
+        recovery for either lock is to stop asking for MATCH_FORMAT and join the engine's own
+        period - not to change format.
+    */
     bool initialiseLowLatencyClient (int bufferSizeSamples, WAVEFORMATEXTENSIBLE format)
     {
-        if (auto audioClient3 = client.getInterface<IAudioClient3>())
-            return check (audioClient3->InitializeSharedAudioStream (getStreamFlags(),
-                                                                     (UINT32) bufferSizeSamples,
-                                                                     (WAVEFORMATEX*) &format,
-                                                                     nullptr));
+        auto audioClient3 = client.getInterface<IAudioClient3>();
+        probe.hasAudioClient3 = (audioClient3 != nullptr);
+
+        if (audioClient3 == nullptr)
+            return false;
+
+        auto periodFrames = (UINT32) bufferSizeSamples;
+
+        // One initial attempt plus at most two retries. On the usual refusal both recoveries -
+        // dropping MATCH_FORMAT and adopting the engine's period - are applied by the same pass.
+        for (int attempt = 0; attempt < 3; ++attempt)
+        {
+            auto hr = audioClient3->InitializeSharedAudioStream (getStreamFlags(),
+                                                                 periodFrames,
+                                                                 (WAVEFORMATEX*) &format,
+                                                                 nullptr);
+            probe.initSharedStreamResult = hr;
+            ++probe.initSharedStreamAttempts;
+            logFailure (hr);
+
+            if (SUCCEEDED (hr))
+            {
+                probe.usedLowLatencyClient = true;
+                return true;
+            }
+
+            const auto periodicityLocked = (hr == MAKE_HRESULT (1, 0x889, 0x028)); // AUDCLNT_E_ENGINE_PERIODICITY_LOCKED
+            const auto formatLocked      = (hr == MAKE_HRESULT (1, 0x889, 0x029)); // AUDCLNT_E_ENGINE_FORMAT_LOCKED
+
+            if (! (periodicityLocked || formatLocked))
+                return false;
+
+            WAVEFORMATEX* currentFormat = nullptr;
+            UINT32 currentPeriod = 0;
+
+            auto periodHr = audioClient3->GetCurrentSharedModeEnginePeriod (&currentFormat, &currentPeriod);
+            probe.currentEnginePeriodResult = periodHr;
+
+            auto changed = false;
+
+            if (check (periodHr))
+            {
+                probe.currentEnginePeriodFrames = currentPeriod;
+
+                if (currentFormat != nullptr)
+                    probe.currentEngineSampleRate = (double) currentFormat->nSamplesPerSec;
+
+                // Only follow the engine's period when it is the period that was refused -
+                // a locked format does not stop us asking for a small buffer.
+                if (periodicityLocked && currentPeriod != 0 && currentPeriod != periodFrames)
+                {
+                    periodFrames = currentPeriod;
+                    changed = true;
+                }
+            }
+
+            CoTaskMemFree (currentFormat);
+
+            // Vochlea: MATCH_FORMAT provokes BOTH locks - Microsoft returns either one only when
+            // it was requested, and documents the same recovery for both: call SetClientProperties
+            // without the match-format option, then use the engine's current format/periodicity.
+            // Dropping it on a periodicity lock as well is what makes the period retry above mean
+            // anything: reapplying MATCH_FORMAT just earns the same error, and periodFrames now
+            // equals the engine period so nothing would have `changed` on the next pass. If it was
+            // already off, the engine holds terms we cannot meet and the standard client is the
+            // answer.
+            if ((periodicityLocked || formatLocked) && ! matchFormatDisabled)
+            {
+                matchFormatDisabled = true;
+                changed = true;
+            }
+
+            if (! changed)
+                return false;
+
+            // A failed Initialize leaves the client unusable, exactly as in the alignment
+            // dance below, so it has to be released and recreated before the retry - and
+            // audioClient3 holds a reference of its own, so it has to go first.
+            audioClient3 = nullptr;
+            client = nullptr;
+            client = createClient();
+
+            if (client == nullptr)
+                return false;
+
+            audioClient3 = client.getInterface<IAudioClient3>();
+
+            if (audioClient3 == nullptr)
+                return false;
+        }
 
         return false;
     }
@@ -894,10 +1317,52 @@ private:
 
     bool tryInitialisingWithBufferSize (int bufferSizeSamples)
     {
+        if (initialiseClient (bufferSizeSamples))
+            return true;
+
+        // Vochlea: last resort. If we asked for a raw (APO-bypassing) stream and nothing would
+        // open, drop that request and try once more exactly as stock JUCE would. Losing the APO
+        // bypass costs detection accuracy; losing the device costs everything.
+        if (rawStreamOptionsRequested && ! rawStreamOptionsDisabled)
+        {
+            rawStreamOptionsDisabled = true;
+            matchFormatDisabled = true;
+            probe.rawProcessingEnabled = false;
+
+            client = nullptr;
+            client = createClient();
+
+            return client != nullptr && initialiseClient (bufferSizeSamples);
+        }
+
+        return false;
+    }
+
+    bool initialiseClient (int bufferSizeSamples)
+    {
         if (auto format = findSupportedFormat (client, numChannels, sampleRate))
         {
-            auto isInitialised = isLowLatencyMode (deviceMode) ? initialiseLowLatencyClient (bufferSizeSamples, *format)
-                                                               : initialiseStandardClient   (bufferSizeSamples, *format);
+            auto isInitialised = isLowLatencyMode (deviceMode) && initialiseLowLatencyClient (bufferSizeSamples, *format);
+
+            // Vochlea: degrade to the standard shared client rather than failing to open.
+            // This is what catches drivers with no IAudioClient3 at all, and engines whose
+            // period or format we could not join above. A device that opens at the standard
+            // 10ms period beats a device that does not open.
+            if (! isInitialised)
+            {
+                if (isLowLatencyMode (deviceMode))
+                {
+                    // MATCH_FORMAT only ever makes sense paired with the FORMAT_LOCKED
+                    // recovery above, which we have just exhausted - never carry it into a
+                    // plain IAudioClient::Initialize, where a locked engine has no recovery.
+                    matchFormatDisabled = true;
+
+                    client = nullptr;
+                    client = createClient();
+                }
+
+                isInitialised = client != nullptr && initialiseStandardClient (bufferSizeSamples, *format);
+            }
 
             if (isInitialised)
             {
@@ -923,7 +1388,7 @@ class WASAPIInputDevice final : public WASAPIDeviceBase
 {
 public:
     WASAPIInputDevice (const ComSmartPtr<IMMDevice>& d, WASAPIDeviceMode mode)
-        : WASAPIDeviceBase (d, mode)
+        : WASAPIDeviceBase (d, mode, true)
     {
     }
 
@@ -968,7 +1433,7 @@ public:
 
         queue = SingleThreadedAbstractFifo (reservoirSize);
         reservoir.setSize ((size_t) (queue.getSize() * bytesPerFrame), true);
-        xruns = 0;
+        xruns.store (0, std::memory_order_relaxed);
 
         if (! check (client->Start()))
             return false;
@@ -1003,7 +1468,7 @@ public:
         while (check (captureClient->GetBuffer (&inputData, &numSamplesAvailable, &flags, nullptr, nullptr)) && numSamplesAvailable > 0)
         {
             if ((flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0)
-                xruns++;
+                xruns.fetch_add (1, std::memory_order_relaxed);
 
             if (numSamplesAvailable > (UINT32) queue.getRemainingSpace())
             {
@@ -1044,11 +1509,16 @@ public:
 
         for (const auto& block : queue.read (jmin (queue.getNumReadable(), bufferSize)))
         {
+            // Vochlea: a source index past the negotiated frame would read off the end of the
+            // reservoir. Clamping duplicates the last real channel, which is the benign outcome
+            // here; a no-op whenever the format carries at least the requested channels.
+            const auto highestSourceChannel = jmax (0, actualNumChannels - 1);
+
             for (auto i = 0; i < numDestBuffers; ++i)
                 converter->convertSamples (destBuffers[i] + offset,
                                            0,
                                            addBytesToPointer (reservoir.getData(), block.getStart() * bytesPerFrame),
-                                           channelMaps.getUnchecked (i),
+                                           jmin (channelMaps.getUnchecked (i), highestSourceChannel),
                                            block.getLength());
 
             offset += block.getLength();
@@ -1058,7 +1528,7 @@ public:
     ComSmartPtr<IAudioCaptureClient> captureClient;
     MemoryBlock reservoir;
     SingleThreadedAbstractFifo queue;
-    int xruns = 0;
+    std::atomic<int> xruns { 0 };
 
     std::unique_ptr<AudioData::Converter> converter;
 
@@ -1071,7 +1541,7 @@ class WASAPIOutputDevice final : public WASAPIDeviceBase
 {
 public:
     WASAPIOutputDevice (const ComSmartPtr<IMMDevice>& d, WASAPIDeviceMode mode)
-        : WASAPIDeviceBase (d, mode)
+        : WASAPIDeviceBase (d, mode, false)
     {
     }
 
@@ -1134,7 +1604,14 @@ public:
             UINT32 padding = 0;
 
             if (check (client->GetCurrentPadding (&padding)))
-                return (int) actualBufferSize - (int) padding;
+            {
+                // Whatever is already queued has to drain before new audio is heard, so the queue
+                // depth we leave behind is the output latency - cap it instead of filling the ring.
+                const auto limit = queueTargetFrames > 0 ? jmin ((int) actualBufferSize, queueTargetFrames)
+                                                         : (int) actualBufferSize;
+
+                return jmax (0, limit - (int) padding);
+            }
         }
 
         return (int) actualBufferSize;
@@ -1175,8 +1652,20 @@ public:
             uint8* outputData = nullptr;
             if (check (renderClient->GetBuffer ((UINT32) samplesToDo, &outputData)))
             {
+                // Vochlea: GetBuffer does not zero, and any destination channel we skip below -
+                // or never selected at all - would otherwise emit whatever was last in the slot.
+                zeromem (outputData, (size_t) samplesToDo * (size_t) bytesPerFrame);
+
                 for (int i = 0; i < numChannelsToCopy; ++i)
-                    converter->convertSamples (outputData, channelMaps.getUnchecked (i), srcBuffers[i] + offset, 0, samplesToDo);
+                {
+                    // A destination past the negotiated frame is dropped, not folded onto another
+                    // channel: writing it would corrupt the render buffer, and clamping it would
+                    // overwrite a channel that has its own source.
+                    const auto destChannel = channelMaps.getUnchecked (i);
+
+                    if (destChannel < actualNumChannels)
+                        converter->convertSamples (outputData, destChannel, srcBuffers[i] + offset, 0, samplesToDo);
+                }
 
                 renderClient->ReleaseBuffer ((UINT32) samplesToDo, 0);
             }
@@ -1189,9 +1678,38 @@ public:
     ComSmartPtr<IAudioRenderClient> renderClient;
     std::unique_ptr<AudioData::Converter> converter;
 
+    // Vochlea: shared-mode cap on queued frames, set once per open before the device is started.
+    // Zero keeps the stock fill-the-ring behaviour (and is what exclusive mode always uses).
+    int queueTargetFrames = 0;
+
 private:
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (WASAPIOutputDevice)
 };
+
+//==============================================================================
+/*  Vochlea: one engine period for this device, at the negotiated rate. The IAudioClient3 probe
+    periods stay zero when unavailable, so fall back to the measured GetDevicePeriod default and
+    never report more than the ring the client actually opened with.
+*/
+static constexpr double sharedModeQueueTargetSecs = 0.016;
+
+static int wasapiEnginePeriodFrames (WASAPIDeviceBase* d)
+{
+    if (d == nullptr)
+        return 0;
+
+    if (d->probe.currentEnginePeriodFrames > 0)
+        return (int) d->probe.currentEnginePeriodFrames;
+
+    if (d->probe.defaultPeriodFrames > 0)
+        return (int) d->probe.defaultPeriodFrames;
+
+    if (d->probe.devicePeriodDefaultFrames > 0 && d->defaultSampleRate > 0)
+        return jmin ((int) d->actualBufferSize,
+                     roundToInt (d->probe.devicePeriodDefaultFrames * d->sampleRate / d->defaultSampleRate));
+
+    return (int) d->actualBufferSize;
+}
 
 //==============================================================================
 class WASAPIAudioIODevice final : public AudioIODevice,
@@ -1342,7 +1860,7 @@ public:
     BigInteger getActiveOutputChannels() const override     { return outputDevice != nullptr ? outputDevice->channels : BigInteger(); }
     BigInteger getActiveInputChannels() const override      { return inputDevice  != nullptr ? inputDevice->channels  : BigInteger(); }
     String getLastError() override                          { return lastError; }
-    int getXRunCount() const noexcept override              { return inputDevice != nullptr ? inputDevice->xruns : -1; }
+    int getXRunCount() const noexcept override              { return inputDevice != nullptr ? inputDevice->xruns.load (std::memory_order_relaxed) : -1; }
 
     std::optional<BigInteger> getDefaultOutputChannels() const override
     {
@@ -1397,12 +1915,52 @@ public:
             currentBufferSizeSamples = (int) (outputDevice != nullptr ? outputDevice->actualBufferSize
                                                                       : inputDevice->actualBufferSize);
         }
+        else if (isLowLatencyMode (deviceMode))
+        {
+            // Vochlea: both new fallbacks under initialiseLowLatencyClient() can come back with a
+            // period we did not ask for - the incumbent engine's period on AUDCLNT_E_ENGINE_
+            // PERIODICITY_LOCKED, or the standard client's default period - and in shared mode
+            // nothing else corrects for it. Left uncorrected the callback consumes less than one
+            // device period per event, so the input reservoir over-fills and the endpoint starts
+            // dropping packets, and getCurrentBufferSizeSamples() plus the latencies derived from
+            // it below both under-report - the exact figure §10 row 4 exists to measure.
+            //
+            // Only ever raises the block size, so it cannot fail an open that has already
+            // succeeded, and unlike the exclusive branch above a mismatch between the two legs is
+            // not an error here: shared mode tolerates a block larger than one period on either
+            // leg (WASAPIOutputDevice::copyBuffers chunks; the input reservoir accumulates).
+            // Deliberately scoped to low-latency mode - plain shared has the same latent
+            // discrepancy but no path here changed its behaviour, so it is left as it was.
+            // Vochlea: one engine period is what the invariant above needs. The endpoint ring is
+            // routinely wider (1056 vs 480 here), and raising to it cost 2.2x the block for nothing.
+            const auto negotiated = jmax (wasapiEnginePeriodFrames (inputDevice.get()),
+                                          wasapiEnginePeriodFrames (outputDevice.get()));
+
+            if (negotiated > currentBufferSizeSamples)
+                currentBufferSizeSamples = negotiated;
+        }
+
+        // Vochlea: shared mode only - exclusive mode has no engine queue to trim and its ring IS
+        // the block. Set before the endpoint is started so start()'s silence prefill uses it too.
+        if (outputDevice != nullptr && ! isExclusiveMode (deviceMode))
+        {
+            const auto ringFrames = (int) outputDevice->actualBufferSize;
+
+            // Below one device period plus one block the ring runs dry between wakeups.
+            const auto floorFrames = jmax (1, wasapiEnginePeriodFrames (outputDevice.get()))
+                                       + jmax (1, currentBufferSizeSamples);
+
+            const auto requested = roundToInt (currentSampleRate * sharedModeQueueTargetSecs);
+
+            outputDevice->queueTargetFrames = jlimit (jmin (floorFrames, ringFrames), ringFrames, requested);
+        }
 
         if (inputDevice != nullptr)   ResetEvent (inputDevice->clientEvent);
         if (outputDevice != nullptr)  ResetEvent (outputDevice->clientEvent);
 
         shouldShutdown = false;
         deviceSampleRateChanged = false;
+        devicesStarted.store (false, std::memory_order_release);
 
         startThread (Priority::high);
         Thread::sleep (5);
@@ -1431,8 +1989,39 @@ public:
             }
         }
 
+        devicesStarted.store (true, std::memory_order_release);
+
         isOpen_ = true;
+        logProbeInfo();
         return lastError;
+    }
+
+    /*  Vochlea addition: records what this open actually negotiated, once per device open, so
+        nothing here is on the audio thread.
+
+        Two sinks, and only the first is durable. The snapshot behind getLastWASAPIProbeReport()
+        (end of this file) is always written and is what the application layer is expected to
+        read. Logger::writeToLog() is best-effort: it is not behind JUCE_WASAPI_LOGGING, but with
+        no juce::Logger installed it falls through to OutputDebugString, i.e. visible under a
+        debugger or DebugView and nowhere else. Installing a Logger at startup would light it up.
+    */
+    void logProbeInfo() const
+    {
+        String report;
+        report << "WASAPI probe: type=\"" << getTypeName() << "\" device=\"" << getName() << "\"";
+
+        if (inputDevice != nullptr)
+            report << newLine << "  input:  " << inputDevice->probe.toString();
+
+        if (outputDevice != nullptr)
+            report << newLine << "  output: " << outputDevice->probe.toString();
+
+        {
+            const ScopedLock sl (getLastProbeReportLock());
+            getLastProbeReportRef() = report;
+        }
+
+        Logger::writeToLog (report);
     }
 
     void close() override
@@ -1446,7 +2035,12 @@ public:
         stopThread (5000);
 
         if (inputDevice != nullptr)   inputDevice->close();
-        if (outputDevice != nullptr)  outputDevice->close();
+
+        if (outputDevice != nullptr)
+        {
+            outputDevice->queueTargetFrames = 0;
+            outputDevice->close();
+        }
 
         isOpen_ = false;
     }
@@ -1519,6 +2113,12 @@ public:
         ins.clear();
         outs.clear();
 
+        // Vochlea: escalate to a shutdown after ~2s of no active session rather than
+        // spinning, so the host's device recovery gets a chance to reopen the endpoint.
+        constexpr int inactivePollIntervalMs = 1;
+        constexpr int maxInactivePolls = 2000;
+        int inactivePolls = 0;
+
         while (! threadShouldExit())
         {
             if ((outputDevice != nullptr && outputDevice->shouldShutdown)
@@ -1530,11 +2130,33 @@ public:
                 break;
             }
 
+            // Nothing may be rendered or captured until open() has started both endpoints.
+            if (! devicesStarted.load (std::memory_order_acquire))
+            {
+                Thread::sleep (1);
+                continue;
+            }
+
             auto inputDeviceActive = (inputDevice != nullptr && inputDevice->isActive);
             auto outputDeviceActive = (outputDevice != nullptr && outputDevice->isActive);
 
             if (! inputDeviceActive && ! outputDeviceActive)
+            {
+                // Vochlea: an output-only device has inputDevice == nullptr, so one inactive
+                // render session latched this into a silent unbounded spin that never recovers.
+                if (++inactivePolls > maxInactivePolls)
+                {
+                    shouldShutdown = true;
+                    triggerAsyncUpdate();
+
+                    break;
+                }
+
+                Thread::sleep (inactivePollIntervalMs);
                 continue;
+            }
+
+            inactivePolls = 0;
 
             if (inputDeviceActive)
             {
@@ -1621,6 +2243,10 @@ private:
     CriticalSection startStopLock;
 
     std::atomic<bool> shouldShutdown { false }, deviceSampleRateChanged { false };
+
+    // Vochlea: gates run() until open() has started both endpoints - the device thread is launched
+    // first, so without it a whole ring of audio is rendered into a stream that cannot drain yet.
+    std::atomic<bool> devicesStarted { false };
 
     BigInteger lastKnownInputChannels, lastKnownOutputChannels;
 
@@ -2019,6 +2645,23 @@ struct MMDeviceMasterVolume
 };
 
 } // namespace WasapiClasses
+
+//==============================================================================
+/*  Vochlea addition: the probe values for the most recently opened WASAPI device, as a
+    single preformatted string.
+
+    Deliberately not a struct: the app-side analytics wiring lives in another repo layer and
+    only needs `namespace juce { extern String getLastWASAPIProbeReport(); }` to consume this,
+    with no shared type and no new public JUCE header. Per-field accessors were removed because
+    they cannot be called - WASAPIProbeInfo and WASAPIAudioIODevice both live in an anonymous-by-
+    convention implementation namespace that no header exposes, so this string is the only route
+    off the machine. Keep it parseable.
+*/
+String getLastWASAPIProbeReport()
+{
+    const ScopedLock sl (WasapiClasses::getLastProbeReportLock());
+    return WasapiClasses::getLastProbeReportRef();
+}
 
 //==============================================================================
 #define JUCE_SYSTEMAUDIOVOL_IMPLEMENTED 1

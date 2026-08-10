@@ -274,6 +274,13 @@ public:
     /** Returns the last error that happened if anything went wrong. */
     virtual String getLastError() = 0;
 
+    /*  Vochlea addition: true while the device is closing and reopening itself from its own
+        driver-reset callback. The reopen pumps the message queue, so a watchdog dispatched
+        inside it observes a closed device and cannot otherwise tell that apart from one that
+        died - and destroying the device there frees an object whose reset frame is still live.
+    */
+    virtual bool isInsideDeviceReset() const noexcept    { return false; }
+
     //==============================================================================
     /** Returns the buffer size that the device is currently using.
 
