@@ -100,6 +100,17 @@ public:
                                                                                              : lastPointerState.position);
     }
 
+    std::optional<Point<float>> getScreenPositionIfAvailable() const noexcept
+    {
+        if (inputType == MouseInputSource::InputSourceType::touch)
+            return getScreenPosition();
+
+        if (const auto raw = MouseInputSource::getCurrentRawMousePositionIfAvailable())
+            return SH::unscaledScreenPosToScaled (unboundedMouseOffset + *raw);
+
+        return {};
+    }
+
     void setScreenPosition (Point<float> p)
     {
         MouseInputSource::setRawMousePosition (SH::scaledScreenPosToUnscaled (p));

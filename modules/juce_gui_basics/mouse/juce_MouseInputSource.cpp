@@ -56,6 +56,15 @@ int MouseInputSource::getIndex() const noexcept                                 
 bool MouseInputSource::isDragging() const noexcept                              { return pimpl->isDragging(); }
 Point<float> MouseInputSource::getScreenPosition() const noexcept               { return pimpl->getScreenPosition(); }
 Point<float> MouseInputSource::getRawScreenPosition() const noexcept            { return pimpl->getRawScreenPosition();  }
+std::optional<Point<float>> MouseInputSource::getScreenPositionIfAvailable() const noexcept { return pimpl->getScreenPositionIfAvailable(); }
+
+#if ! JUCE_WINDOWS
+std::optional<Point<float>> MouseInputSource::getCurrentRawMousePositionIfAvailable()
+{
+    return getCurrentRawMousePosition();
+}
+#endif
+
 ModifierKeys MouseInputSource::getCurrentModifiers() const noexcept             { return pimpl->getCurrentModifiers(); }
 float MouseInputSource::getCurrentPressure() const noexcept                     { return pimpl->lastPointerState.pressure; }
 bool MouseInputSource::isPressureValid() const noexcept                         { return pimpl->lastPointerState.isPressureValid(); }
