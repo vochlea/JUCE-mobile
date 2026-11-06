@@ -201,20 +201,39 @@ public:
 
     HbFont getFontAtSizeAndScale (TypefaceMetricsKind kind, float height, float horizontalScale) const
     {
-        HbFont subFont { hb_font_create_sub_font (font) };
         const auto points = height * getMetrics (kind).getHeightToPointsFactor();
 
-        hb_font_set_ptem (subFont.get(), points);
-        hb_font_set_scale (subFont.get(), HbScale::juceToHb (points * horizontalScale), HbScale::juceToHb (points));
-
        #if JUCE_MAC || JUCE_IOS
-        overrideCTFontAdvances (subFont.get(), hb_coretext_font_get_ct_font (subFont.get()));
-       #endif
+        // Each sized font creates a CTFont, which costs more than the shaping it is used for.
+        // A cached font holds its parent, so the parent's address can't be reused while it is a key.
+        static std::mutex mutex;
+        static LruCache<std::tuple<hb_font_t*, float, float>, HbFont> cache;
 
-        return subFont;
+        const std::scoped_lock lock { mutex };
+        const auto& sized = cache.get ({ font, points, horizontalScale }, [] (const auto& key)
+        {
+            const auto [parent, pt, scale] = key;
+            auto subFont = createSubFont (parent, pt, scale);
+            overrideCTFontAdvances (subFont.get(), hb_coretext_font_get_ct_font (subFont.get()));
+            hb_font_make_immutable (subFont.get());
+            return subFont;
+        });
+
+        return HbFont { hb_font_reference (sized.get()) };
+       #else
+        return createSubFont (font, points, horizontalScale);
+       #endif
     }
 
 private:
+    static HbFont createSubFont (hb_font_t* parent, float points, float horizontalScale)
+    {
+        HbFont subFont { hb_font_create_sub_font (parent) };
+        hb_font_set_ptem (subFont.get(), points);
+        hb_font_set_scale (subFont.get(), HbScale::juceToHb (points * horizontalScale), HbScale::juceToHb (points));
+        return subFont;
+    }
+
     static TypefaceAscentDescent findPortableMetrics (hb_font_t* f, TypefaceAscentDescent fallback)
     {
         hb_font_extents_t extents{};
