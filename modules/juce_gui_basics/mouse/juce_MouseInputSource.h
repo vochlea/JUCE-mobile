@@ -118,6 +118,12 @@ public:
     /** Returns the last-known screen position of this source without any scaling applied. */
     Point<float> getRawScreenPosition() const noexcept;
 
+    /** Returns the current screen position of this source, or nullopt if the OS won't say where
+        the pointer is (on Windows, while another desktop has input: a locked screen, a UAC
+        prompt, or session 0). getScreenPosition() then returns the last position it could read.
+    */
+    std::optional<Point<float>> getScreenPositionIfAvailable() const noexcept;
+
     /** Returns a set of modifiers that indicate which buttons are currently
         held down on this device.
     */
@@ -307,6 +313,7 @@ private:
     void handleMagnifyGesture (ComponentPeer&, Point<float>, int64 time, float scaleFactor);
 
     static Point<float> getCurrentRawMousePosition();
+    static std::optional<Point<float>> getCurrentRawMousePositionIfAvailable();
     static void setRawMousePosition (Point<float>);
 
     JUCE_LEAK_DETECTOR (MouseInputSource)

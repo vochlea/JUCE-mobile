@@ -802,15 +802,16 @@ static bool characterNotRendered (uint32_t c)
 
 static bool isFontSuitableForCodepoint (const Font& font, juce_wchar c)
 {
-    const auto& hbFont = font.getNativeDetails().font;
+    // Glyph coverage doesn't depend on size, so query the typeface's font: a sized one costs a new CTFont per call.
+    const auto typeface = font.getTypefacePtr();
 
-    if (hbFont == nullptr)
+    if (typeface == nullptr)
         return false;
 
     hb_codepoint_t glyph{};
 
     return characterNotRendered ((uint32_t) c)
-           || hb_font_get_nominal_glyph (hbFont.get(), (hb_codepoint_t) c, &glyph);
+           || hb_font_get_nominal_glyph (typeface->getNativeDetails().getFont(), (hb_codepoint_t) c, &glyph);
 }
 
 static bool isFontSuitableForText (const Font& font, const String& str)

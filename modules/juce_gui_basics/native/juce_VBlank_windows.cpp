@@ -218,7 +218,7 @@ public:
             UINT i = 0;
             ComSmartPtr<IDXGIOutput> output;
 
-            while (adapter->dxgiAdapter->EnumOutputs (i, output.resetAndGetPointerAddress()) != DXGI_ERROR_NOT_FOUND)
+            while (SUCCEEDED (adapter->dxgiAdapter->EnumOutputs (i, output.resetAndGetPointerAddress())))
             {
                 if (VBlankThread::getMonitorFromOutput (output) == monitor)
                 {

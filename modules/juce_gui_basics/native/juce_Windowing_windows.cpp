@@ -5657,10 +5657,13 @@ bool detail::MouseInputSourceList::canUseTouch() const
     return canUseMultiTouch();
 }
 
-Point<float> MouseInputSource::getCurrentRawMousePosition()
+std::optional<Point<float>> MouseInputSource::getCurrentRawMousePositionIfAvailable()
 {
+    // GetCursorPos fails, leaving the POINT unwritten, while this thread's desktop isn't the input desktop.
     POINT mousePos;
-    GetCursorPos (&mousePos);
+
+    if (! GetCursorPos (&mousePos))
+        return {};
 
     auto p = D2DUtilities::toPoint (mousePos);
 
@@ -5668,6 +5671,20 @@ Point<float> MouseInputSource::getCurrentRawMousePosition()
         p = Desktop::getInstance().getDisplays().physicalToLogical (p);
 
     return p.toFloat();
+}
+
+Point<float> MouseInputSource::getCurrentRawMousePosition()
+{
+    // Consumers poll this for motion, so an unavailable pointer must read as one that has not moved.
+    static std::atomic<Point<float>> lastKnown { Point<float>{} };
+
+    if (const auto position = getCurrentRawMousePositionIfAvailable())
+    {
+        lastKnown.store (*position, std::memory_order_relaxed);
+        return *position;
+    }
+
+    return lastKnown.load (std::memory_order_relaxed);
 }
 
 void MouseInputSource::setRawMousePosition (Point<float> newPosition)
