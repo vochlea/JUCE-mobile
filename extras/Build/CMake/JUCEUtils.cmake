@@ -980,7 +980,9 @@ function(juce_enable_copy_plugin_step shared_code_target)
             continue()
         endif()
 
-        _juce_adhoc_sign("${target}")
+        if(NOT target_kind STREQUAL "VST3" AND NOT target_kind STREQUAL "AU")
+            _juce_adhoc_sign("${target}")
+        endif()
 
         get_target_property(source "${target}" JUCE_PLUGIN_ARTEFACT_FILE)
 
@@ -1220,8 +1222,6 @@ function(_juce_set_plugin_target_properties shared_code_target kind)
 
         _juce_set_copy_properties(${shared_code_target} ${target_name} "${output_path}" JUCE_VST3_COPY_DIR)
 
-        _juce_adhoc_sign(${target_name})
-
         get_target_property(vst3_auto_manifest ${shared_code_target} JUCE_VST3_AUTO_MANIFEST)
 
         add_custom_command(TARGET ${target_name} POST_BUILD
@@ -1356,6 +1356,11 @@ function(_juce_set_plugin_target_properties shared_code_target kind)
             VERBATIM)
 
         _juce_set_copy_properties(${shared_code_target} ${target_name} "${output_path}" JUCE_LV2_COPY_DIR)
+    endif()
+
+    # Seal the complete bundle, after PkgInfo and the VST3 manifest, even when copying is disabled.
+    if(kind STREQUAL "VST3" OR kind STREQUAL "AU")
+        _juce_adhoc_sign(${target_name})
     endif()
 endfunction()
 
