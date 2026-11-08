@@ -37,7 +37,7 @@ if(NOT JUCE_XCRUN)
 endif()
 
 execute_process(
-    COMMAND "${JUCE_XCRUN}" codesign --verify "${src}"
+    COMMAND "${JUCE_XCRUN}" codesign --verify --deep --strict "${src}"
     RESULT_VARIABLE result)
 
 if(result)

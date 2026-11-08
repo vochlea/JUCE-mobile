@@ -961,6 +961,16 @@ function(_juce_adhoc_sign target)
         VERBATIM)
 endfunction()
 
+# When copying is disabled, wait until callers have registered their manifest and
+# custom resource steps. Copy-enabled workflows seal immediately before the copy.
+function(_juce_sign_plugin_if_not_copied shared_code_target target)
+    get_target_property(copy_step_added ${shared_code_target} _JUCE_PLUGIN_COPY_STEP_ADDED)
+
+    if(NOT copy_step_added)
+        _juce_adhoc_sign("${target}")
+    endif()
+endfunction()
+
 function(juce_enable_copy_plugin_step shared_code_target)
     get_target_property(step_added ${shared_code_target} _JUCE_PLUGIN_COPY_STEP_ADDED)
 
@@ -980,9 +990,9 @@ function(juce_enable_copy_plugin_step shared_code_target)
             continue()
         endif()
 
-        if(NOT target_kind STREQUAL "VST3" AND NOT target_kind STREQUAL "AU")
-            _juce_adhoc_sign("${target}")
-        endif()
+        # Callers may have appended bundle resources since juce_add_plugin. Verify/seal
+        # here, immediately before copying the completed bundle.
+        _juce_adhoc_sign("${target}")
 
         get_target_property(source "${target}" JUCE_PLUGIN_ARTEFACT_FILE)
 
@@ -1358,9 +1368,11 @@ function(_juce_set_plugin_target_properties shared_code_target kind)
         _juce_set_copy_properties(${shared_code_target} ${target_name} "${output_path}" JUCE_LV2_COPY_DIR)
     endif()
 
-    # Seal the complete bundle, after PkgInfo and the VST3 manifest, even when copying is disabled.
     if(kind STREQUAL "VST3" OR kind STREQUAL "AU")
-        _juce_adhoc_sign(${target_name})
+        # Capture target names now: DEFER evaluates ordinary arguments at directory end,
+        # after this function's local variables have gone out of scope.
+        cmake_language(EVAL CODE
+            "cmake_language(DEFER CALL _juce_sign_plugin_if_not_copied [[${shared_code_target}]] [[${target_name}]])")
     endif()
 endfunction()
 

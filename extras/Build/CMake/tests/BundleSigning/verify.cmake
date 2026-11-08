@@ -1,0 +1,11 @@
+if(NOT EXISTS "${bundle}/Contents/Resources/custom.txt")
+    message(FATAL_ERROR "Custom post-build resource is missing: ${bundle}")
+endif()
+if(format STREQUAL "VST3" AND NOT EXISTS "${bundle}/Contents/Resources/moduleinfo.json")
+    message(FATAL_ERROR "VST3 manifest is missing: ${bundle}")
+endif()
+execute_process(COMMAND /usr/bin/codesign --verify --deep --strict "${bundle}"
+    RESULT_VARIABLE result)
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "Strict signature verification failed: ${bundle}")
+endif()
