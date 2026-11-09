@@ -310,7 +310,7 @@ public:
         return true;
     }
 
-    void useSamples (const FlacNamespace::FLAC__int32* const buffer[], int numSamples)
+    void useSamples (const FlacNamespace::FLAC__int32* const buffer[], int numBufferChannels, int numSamples)
     {
         if (scanningForLength)
         {
@@ -325,8 +325,9 @@ public:
 
             for (int i = 0; i < (int) numChannels; ++i)
             {
-                auto* src = buffer[i];
-                int n = i;
+                // libFLAC defines only the frame's own channels, which a corrupt file can make fewer than STREAMINFO's
+                int n = jmin (i, numBufferChannels - 1);
+                auto* src = buffer[n];
 
                 while (src == nullptr && n > 0)
                     src = buffer [--n];
@@ -336,7 +337,7 @@ public:
                     auto* dest = reinterpret_cast<int*> (reservoir.getWritePointer (i));
 
                     for (int j = 0; j < numSamples; ++j)
-                        dest[j] = src[j] << bitsToShift;
+                        dest[j] = (int) ((uint32) src[j] << bitsToShift);
                 }
             }
 
@@ -379,7 +380,7 @@ public:
                                                                          const FlacNamespace::FLAC__int32* const buffer[],
                                                                          void* client_data)
     {
-        static_cast<FlacReader*> (client_data)->useSamples (buffer, (int) frame->header.blocksize);
+        static_cast<FlacReader*> (client_data)->useSamples (buffer, (int) frame->header.channels, (int) frame->header.blocksize);
         return FlacNamespace::FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
     }
 
