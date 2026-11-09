@@ -253,7 +253,7 @@ public:
     bool readSamples (int* const* destSamples, int numDestChannels, int startOffsetInDestBuffer,
                       int64 startSampleInFile, int numSamples) override
     {
-        if (! ok)
+        if (! ok || frameContradictsStreamInfo)
             return false;
 
         const auto getBufferedRange = [this] { return bufferedRange; };
@@ -301,6 +301,9 @@ public:
                                                                  readFromReservoir,
                                                                  fillReservoir);
 
+        if (frameContradictsStreamInfo)
+            return false;
+
         if (! remainingSamples.isEmpty())
             for (int i = numDestChannels; --i >= 0;)
                 if (destSamples[i] != nullptr)
@@ -310,8 +313,17 @@ public:
         return true;
     }
 
-    void useSamples (const FlacNamespace::FLAC__int32* const buffer[], int numBufferChannels, int numSamples)
+    bool useSamples (const FlacNamespace::FLAC__Frame& frame, const FlacNamespace::FLAC__int32* const buffer[])
     {
+        // libFLAC defines only the frame's own channels, and this reader lays out and scales by STREAMINFO's
+        if (frame.header.channels != numChannels || frame.header.bits_per_sample != bitsPerSample)
+        {
+            frameContradictsStreamInfo = true;
+            return false;
+        }
+
+        const auto numSamples = (int) frame.header.blocksize;
+
         if (scanningForLength)
         {
             lengthInSamples += numSamples;
@@ -325,9 +337,8 @@ public:
 
             for (int i = 0; i < (int) numChannels; ++i)
             {
-                // libFLAC defines only the frame's own channels, which a corrupt file can make fewer than STREAMINFO's
-                int n = jmin (i, numBufferChannels - 1);
-                auto* src = buffer[n];
+                auto* src = buffer[i];
+                int n = i;
 
                 while (src == nullptr && n > 0)
                     src = buffer [--n];
@@ -343,6 +354,8 @@ public:
 
             bufferedRange.setLength (numSamples);
         }
+
+        return true;
     }
 
     //==============================================================================
@@ -380,8 +393,9 @@ public:
                                                                          const FlacNamespace::FLAC__int32* const buffer[],
                                                                          void* client_data)
     {
-        static_cast<FlacReader*> (client_data)->useSamples (buffer, (int) frame->header.channels, (int) frame->header.blocksize);
-        return FlacNamespace::FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
+        return static_cast<FlacReader*> (client_data)->useSamples (*frame, buffer)
+                 ? FlacNamespace::FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE
+                 : FlacNamespace::FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
     }
 
     static void metadataCallback_ (const FlacNamespace::FLAC__StreamDecoder*,
@@ -399,7 +413,7 @@ private:
     FlacNamespace::FLAC__StreamDecoder* decoder;
     AudioBuffer<float> reservoir;
     Range<int64> bufferedRange;
-    bool ok = false, scanningForLength = false;
+    bool ok = false, scanningForLength = false, frameContradictsStreamInfo = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FlacReader)
 };
