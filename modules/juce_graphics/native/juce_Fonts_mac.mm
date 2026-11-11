@@ -135,10 +135,25 @@ class CoreTextTypeface final : public Typeface
 public:
     static Typeface::Ptr from (const Font& font)
     {
+        bool explicitFace = false;
         auto ctFont = [&]() -> CFUniquePtr<CTFontRef>
         {
             if (auto f = getRegistered().findMatch (font.getTypefaceName(), font.getTypefaceStyle()))
                 return f;
+
+            const CFUniquePtr<CFStringRef> requestedName (font.getTypefaceName().toCFString());
+            CFUniquePtr<CTFontRef> named (CTFontCreateWithName (requestedName.get(), 1, nullptr));
+            if (named != nullptr)
+            {
+                const CFUniquePtr<CFStringRef> postscript (CTFontCopyPostScriptName (named.get()));
+                const CFUniquePtr<CFStringRef> family (CTFontCopyFamilyName (named.get()));
+                // An explicit PostScript face must not be reinterpreted as a family plus a generic style.
+                if (CFEqual (requestedName.get(), postscript.get()) && ! CFEqual (requestedName.get(), family.get()))
+                {
+                    explicitFace = true;
+                    return named;
+                }
+            }
 
             CFUniquePtr<CFStringRef> cfFontFamily (FontStyleHelpers::getConcreteFamilyName (font).toCFString());
 
@@ -179,7 +194,10 @@ public:
         if (result == nullptr)
             return {};
 
-        FontStyleHelpers::initSynthetics (result.get(), font);
+        if (! explicitFace)
+        {
+            FontStyleHelpers::initSynthetics (result.get(), font);
+        }
 
         return new CoreTextTypeface (std::move (ctFont), std::move (result), font.getTypefaceName(), font.getTypefaceStyle());
     }
