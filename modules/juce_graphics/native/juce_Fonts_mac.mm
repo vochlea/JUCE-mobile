@@ -194,7 +194,28 @@ public:
         if (result == nullptr)
             return {};
 
-        if (! explicitFace)
+        if (explicitFace)
+        {
+            const auto traits = CTFontGetSymbolicTraits (ctFont.get());
+            const CFUniquePtr<CFDictionaryRef> attributes (CTFontCopyTraits (ctFont.get()));
+            const auto weightValue = (CFNumberRef) CFDictionaryGetValue (attributes.get(), kCTFontWeightTrait);
+            double weight = 0;
+            if (weightValue != nullptr)
+            {
+                CFNumberGetValue (weightValue, kCFNumberDoubleType, &weight);
+            }
+
+            // CoreText may omit the Bold symbolic trait for semibold faces; check their weight too.
+            if (font.isBold() && (traits & kCTFontBoldTrait) == 0 && weight < 0.3)
+            {
+                hb_font_set_synthetic_bold (result.get(), 0.04f, 0.04f, true);
+            }
+            if (font.isItalic() && (traits & kCTFontItalicTrait) == 0)
+            {
+                hb_font_set_synthetic_slant (result.get(), 0.1f);
+            }
+        }
+        else
         {
             FontStyleHelpers::initSynthetics (result.get(), font);
         }
