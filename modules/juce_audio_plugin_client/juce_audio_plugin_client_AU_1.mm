@@ -69,6 +69,7 @@ JUCE_END_IGNORE_WARNINGS_GCC_LIKE
 #define JUCE_CORE_INCLUDE_OBJC_HELPERS 1
 
 #include <juce_audio_plugin_client/detail/juce_PluginUtilities.h>
+#include <juce_gui_basics/native/juce_EmbeddedViewKeys_mac.h>
 
 #include <juce_audio_basics/native/juce_CoreAudioLayouts_mac.h>
 #include <juce_audio_basics/native/juce_CoreAudioTimeConversions_mac.h>
@@ -1747,13 +1748,7 @@ public:
                     {
                         lastEventTime = eventTime;
 
-                        auto* view = (NSView*) getWindowHandle();
-                        auto* hostView = [view superview];
-                        auto* hostWindow = [hostView window];
-
-                        [hostWindow makeFirstResponder: hostView];
-                        [hostView keyDown: currentEvent];
-                        [hostWindow makeFirstResponder: view];
+                        forwardKeyToHostView (getWindowHandle(), currentEvent);
                     }
                 }
             }
@@ -1824,10 +1819,8 @@ public:
             {
                 if (NSWindow* w = [(NSView*) self window])
                 {
+                    // The editor's peer takes the window's keys itself, while the window is key and no host field has them.
                     [w setAcceptsMouseMovedEvents: YES];
-
-                    if (EditorCompHolder* const editorComp = getEditor (self))
-                        [w makeFirstResponder: (NSView*) editorComp->getWindowHandle()];
                 }
             });
 
