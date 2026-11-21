@@ -32,8 +32,6 @@
   ==============================================================================
 */
 
-#include "juce_EmbeddedViewKeys_mac.h"
-
 @interface NSEvent (DeviceDelta)
 - (float)deviceDeltaX;
 - (float)deviceDeltaY;
@@ -314,12 +312,6 @@ public:
     {
         scopedObservers.clear();
 
-        // The view's resignFirstResponder below can no longer reach us: else a later peer at this address reads as focused.
-        if (currentlyFocusedPeer == this)
-        {
-            currentlyFocusedPeer = nullptr;
-        }
-
         setOwner (view, nullptr);
 
         if ([view superview] != nil)
@@ -347,14 +339,9 @@ public:
         if (isSharedWindow)
         {
             if (shouldBeVisible)
-            {
                 [view setHidden: false];
-                claimHostWindowKeys ([window isKeyWindow]);
-            }
             else if ([window firstResponder] != view || ([window firstResponder] == view && [window makeFirstResponder: nil]))
-            {
                 [view setHidden: true];
-            }
         }
         else
         {
@@ -645,15 +632,10 @@ public:
         {
             ++insideToFrontCall;
 
-            // As in grabFocus: an embedded view's window is the host's, never ours to make key.
-            if (makeActiveWindow && ! isSharedWindow && ! inBecomeKeyWindow && [window canBecomeKeyWindow])
-            {
+            if (makeActiveWindow && ! inBecomeKeyWindow && [window canBecomeKeyWindow])
                 [window makeKeyAndOrderFront: nil];
-            }
             else
-            {
                 [window orderFront: nil];
-            }
 
             if (insideToFrontCall <= 1)
             {
@@ -1267,9 +1249,6 @@ public:
             windowObservers.emplace_back (view, becomeKeySelector, NSWindowDidBecomeKeyNotification, currentWindow);
             windowObservers.emplace_back (view, resignKeySelector, NSWindowDidResignKeyNotification, currentWindow);
         }
-
-        keysClaimedIn = nil;
-        claimHostWindowKeys ([window isKeyWindow]);
     }
 
     void dismissModals()
@@ -1281,78 +1260,6 @@ public:
     void becomeKey()
     {
         component.repaint();
-
-        if (! isSharedWindow)
-        {
-            return;
-        }
-
-        // resignKey took our focus, and AppKit does not re-send becomeFirstResponder to a view that kept it.
-        if (firstResponderIsWithinView())
-        {
-            viewFocusGain();
-        }
-        else
-        {
-            claimHostWindowKeys (true);
-        }
-    }
-
-    bool firstResponderIsWithinView() const
-    {
-        auto* first = [window firstResponder];
-        return [first isKindOfClass: [NSView class]] && [(NSView*) first isDescendantOf: view];
-    }
-
-    // A host's window never makes an embedded view first responder (JUCE's VST3 wrapper doesn't), so take its
-    // keys once per window, while it is key, unless a host text field or another embedded JUCE view has them.
-    void claimHostWindowKeys (bool windowIsKey)
-    {
-        if (! isSharedWindow || window == nil || ! windowIsKey || keysClaimedIn == window || ! canBecomeKeyWindow())
-        {
-            return;
-        }
-
-        NSWindow* hostWindow = window;
-
-        if (! firstResponderIsWithinView())
-        {
-            auto* first = [hostWindow firstResponder];
-
-            if ([first isKindOfClass: [NSText class]] || isWithinAnotherPeersView (first))
-            {
-                return;
-            }
-
-            const bool taken = [hostWindow makeFirstResponder: view];
-
-            // JUCE's focus callbacks ran inside that call, and one of them may have deleted this peer.
-            if (! isValidPeer (this) || ! taken)
-            {
-                return;
-            }
-        }
-
-        keysClaimedIn = hostWindow;
-    }
-
-    bool isWithinAnotherPeersView (NSResponder* responder) const
-    {
-        if (! [responder isKindOfClass: [NSView class]])
-        {
-            return false;
-        }
-
-        for (int i = getNumPeers(); --i >= 0;)
-        {
-            if (auto* other = dynamic_cast<NSViewComponentPeer*> (getPeer (i)); other != nullptr && other != this
-                && [(NSView*) responder isDescendantOf: other->view])
-            {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     void resignKey()
@@ -1635,28 +1542,13 @@ public:
     //==============================================================================
     void viewFocusGain()
     {
-        // JUCE focus is the key window's: an embedded view made first responder in a host window that isn't key (the AU
-        // wrapper's restore after a forwarded key) waits for becomeKey, and never takes focus from the key window's peer.
-        if (isSharedWindow && ! [window isKeyWindow])
-        {
-            return;
-        }
-
         if (currentlyFocusedPeer != this)
         {
-            // Published before the old peer's loss callbacks run: if they destroy this peer (its destructor clears the
-            // static) or move focus again, the static no longer names this peer and we stop without touching it.
-            auto* previous = std::exchange (currentlyFocusedPeer, this);
+            if (ComponentPeer::isValidPeer (currentlyFocusedPeer))
+                currentlyFocusedPeer->handleFocusLoss();
 
-            if (ComponentPeer::isValidPeer (previous))
-            {
-                previous->handleFocusLoss();
-            }
-
-            if (currentlyFocusedPeer == this)
-            {
-                handleFocusGain();
-            }
+            currentlyFocusedPeer = this;
+            handleFocusGain();
         }
     }
 
@@ -1667,11 +1559,6 @@ public:
             currentlyFocusedPeer = nullptr;
             handleFocusLoss();
         }
-    }
-
-    static ComponentPeer* getCurrentlyFocusedPeer() noexcept
-    {
-        return currentlyFocusedPeer;
     }
 
     bool isFocused() const override
@@ -1685,12 +1572,8 @@ public:
     {
         if (window != nil)
         {
-            // An embedded view's window is the host's: making it key would take the keys from the window the host made
-            // key. Only a peer that owns its window activates it; AppKit keys a window clicked into by itself.
-            if (! isSharedWindow && ! inBecomeKeyWindow && [window canBecomeKeyWindow])
-            {
+            if (! inBecomeKeyWindow && [window canBecomeKeyWindow])
                 [window makeKeyWindow];
-            }
 
             [window makeFirstResponder: view];
 
@@ -1858,7 +1741,6 @@ public:
     std::optional<KeyEventAttributes> lastSeenKeyEvent;
 
     static inline ComponentPeer* currentlyFocusedPeer;
-    NSWindow* keysClaimedIn = nil; // compared only: the host window whose keys this embedded view has taken
     static inline std::set<int> keysCurrentlyDown;
     static inline int insideToFrontCall;
 
@@ -3201,33 +3083,5 @@ const int KeyPress::playKey                 = extendedKeyModifier + 0x00;
 const int KeyPress::stopKey                 = extendedKeyModifier + 0x01;
 const int KeyPress::fastForwardKey          = extendedKeyModifier + 0x02;
 const int KeyPress::rewindKey               = extendedKeyModifier + 0x03;
-
-//==============================================================================
-void forwardKeyToHostView (void* embeddedView, void* keyEvent)
-{
-    const NSUniquePtr<NSView> view ([(NSView*) embeddedView retain]);
-    NSView* hostView = [view.get() superview];
-    NSWindow* hostWindow = [hostView window];
-
-    if (hostWindow == nil)
-    {
-        return;
-    }
-
-    [hostWindow makeFirstResponder: hostView];
-    [hostView keyDown: (NSEvent*) keyEvent];
-
-    // The host may give its keys elsewhere while handling this one (another instance's view, in this window or
-    // another): only a handoff still in place is undone, so the keys never go back to a view the host moved on from.
-    if ([hostWindow firstResponder] == hostView)
-    {
-        [hostWindow makeFirstResponder: view.get()];
-    }
-}
-
-ComponentPeer* getFocusedNSViewPeer() noexcept
-{
-    return NSViewComponentPeer::getCurrentlyFocusedPeer();
-}
 
 } // namespace juce
