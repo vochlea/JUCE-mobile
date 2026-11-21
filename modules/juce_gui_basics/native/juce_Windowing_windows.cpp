@@ -2809,7 +2809,7 @@ private:
         }
     }
 
-    void doMouseUp (Point<float> position, const WPARAM wParam, bool adjustCapture = true)
+    void doMouseUp (Point<float> position, const WPARAM wParam, bool adjustCapture = true, bool cancelled = false)
     {
         // this will be handled by WM_TOUCH
         if (isTouchEvent() || areOtherTouchSourcesActive())
@@ -2826,7 +2826,12 @@ private:
         // NB: under some circumstances (e.g. double-clicking a native title bar), a mouse-up can
         // arrive without a mouse-down, so in that case we need to avoid sending a message.
         if (wasDragging)
-            doMouseEvent (position, MouseInputSource::defaultPressure);
+        {
+            if (cancelled)
+                handleMouseCancel (MouseInputSource::InputSourceType::mouse, position, ModifierKeys::currentModifiers, getMouseEventTime());
+            else
+                doMouseEvent (position, MouseInputSource::defaultPressure);
+        }
     }
 
     void doCaptureChanged()
@@ -2839,8 +2844,59 @@ private:
             constrainerIsResizing = false;
         }
 
+        // The capture was taken, not released: the press ends as a cancel, never a click.
         if (isDragging)
-            doMouseUp (getCurrentMousePos(), (WPARAM) 0, false);
+            doMouseUp (getCurrentMousePos(), (WPARAM) 0, false, true);
+    }
+
+    // Another window took a pen or touch pointer: no WM_POINTERUP follows, so its press ends here as a cancel, and the
+    // source and touch bookkeeping are cleared, or the source stays dragging and mouse input is ignored after it.
+    void doPointerCaptureChanged (const WPARAM wParam)
+    {
+        if (! canUsePointerAPI)
+            return;
+
+        const auto type = getPointerType (wParam);
+        auto touchIndex = 0;
+
+        if (type == MouseInputSource::InputSourceType::touch)
+        {
+            touchIndex = currentTouches.findIndexOfTouch (this, GET_POINTERID_WPARAM (wParam));
+
+            if (touchIndex < 0)
+                return;
+
+            currentTouches.clearTouch (touchIndex);
+        }
+        else if (type != MouseInputSource::InputSourceType::pen)
+        {
+            return;
+        }
+
+        ModifierKeys::currentModifiers = ModifierKeys::currentModifiers.withoutMouseButtons();
+        const auto time = getMouseEventTime();
+
+        for (auto& source : Desktop::getInstance().getMouseSources())
+        {
+            if (source.getType() != type || source.getIndex() != touchIndex || ! source.isDragging())
+                continue;
+
+            handleMouseCancel (type, globalToLocal (source.getRawScreenPosition()), ModifierKeys::currentModifiers, time, touchIndex);
+
+            if (! isValidPeer (this))
+                return;
+
+            handleMouseEvent (type, MouseInputSource::offscreenMousePos, ModifierKeys::currentModifiers, MouseInputSource::defaultPressure,
+                              MouseInputSource::defaultOrientation, time, {}, touchIndex);
+
+            if (! isValidPeer (this))
+                return;
+
+            break;
+        }
+
+        if (type == MouseInputSource::InputSourceType::touch && ! currentTouches.areAnyTouchesActive())
+            currentTouches.clear();
     }
 
     void doMouseExit()
@@ -3958,6 +4014,10 @@ private:
                 if (handlePointerInput (wParam, lParam, false, true))
                     return 0;
                 break;
+
+            case WM_POINTERCAPTURECHANGED:
+                doPointerCaptureChanged (wParam);
+                return 0;
 
             //==============================================================================
             case WM_NCMOUSEMOVE:

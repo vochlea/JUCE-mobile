@@ -112,6 +112,14 @@ public:
     /** Returns true if this device is currently being pressed. */
     bool isDragging() const noexcept;
 
+    /** Returns true while this source delivers the mouse-up of a press the system took away
+        (another window took the capture) rather than one the user released.
+
+        Call it from mouseUp() to tell the two apart: a cancelled press should not act as a click.
+        At any other time it returns false.
+    */
+    bool isPressCancelled() const noexcept;
+
     /** Returns the last-known screen position of this source. */
     Point<float> getScreenPosition() const noexcept;
 

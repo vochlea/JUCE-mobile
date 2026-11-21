@@ -54,6 +54,7 @@ bool MouseInputSource::canHover() const noexcept                                
 bool MouseInputSource::hasMouseWheel() const noexcept                           { return ! isTouch(); }
 int MouseInputSource::getIndex() const noexcept                                 { return pimpl->index; }
 bool MouseInputSource::isDragging() const noexcept                              { return pimpl->isDragging(); }
+bool MouseInputSource::isPressCancelled() const noexcept                        { return pimpl->pressCancelled; }
 Point<float> MouseInputSource::getScreenPosition() const noexcept               { return pimpl->getScreenPosition(); }
 Point<float> MouseInputSource::getRawScreenPosition() const noexcept            { return pimpl->getRawScreenPosition();  }
 std::optional<Point<float>> MouseInputSource::getScreenPositionIfAvailable() const noexcept { return pimpl->getScreenPositionIfAvailable(); }

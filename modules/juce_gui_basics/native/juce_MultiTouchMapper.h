@@ -61,6 +61,16 @@ public:
         return touchIndex;
     }
 
+    /** The index of a touch already down on this peer, or -1: unlike getIndexOfTouch, it never adds one. */
+    int findIndexOfTouch (ComponentPeer* peer, IDType touchID) const
+    {
+        for (int i = 0; i < currentTouches.size(); ++i)
+            if (touchID != 0 && currentTouches[i].touchId == touchID && currentTouches[i].owner == peer)
+                return i;
+
+        return -1;
+    }
+
     void clear()
     {
         currentTouches.clear();

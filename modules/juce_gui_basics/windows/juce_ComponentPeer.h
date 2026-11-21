@@ -416,6 +416,15 @@ public:
     void handleMouseEvent (MouseInputSource::InputSourceType type, Point<float> positionWithinPeer, ModifierKeys newMods, float pressure,
                            float orientation, int64 time, PenDetails pen = {}, int touchIndex = 0);
 
+    /** Ends a press the system took away (a lost capture) with a mouse-up that MouseInputSource::isPressCancelled()
+        reports, so the component under it can tell it from a release.
+    */
+    void handleMouseCancel (MouseInputSource::InputSourceType type, Point<float> positionWithinPeer, ModifierKeys mods,
+                            int64 time, int touchIndex = 0);
+
+    /** Cancels, as handleMouseCancel does, every press whose events last came through this peer. */
+    void cancelPresses (int64 time);
+
     void handleMouseWheel (MouseInputSource::InputSourceType type, Point<float> positionWithinPeer,
                            int64 time, const MouseWheelDetails&, int touchIndex = 0);
 

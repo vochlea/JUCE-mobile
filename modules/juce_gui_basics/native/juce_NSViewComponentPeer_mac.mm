@@ -200,6 +200,7 @@ public:
         resetTrackingArea (view);
 
         scopedObservers.emplace_back (view, frameChangedSelector, NSViewFrameDidChangeNotification, view);
+        scopedObservers.emplace_back (view, cancelPressesSelector, NSMenuDidBeginTrackingNotification, nil);
 
         [view setPostsFrameChangedNotifications: YES];
 
@@ -848,6 +849,7 @@ public:
     void redirectWillMoveToWindow (NSWindow* newWindow)
     {
         windowObservers.clear();
+        cancelPresses();
 
         if (isSharedWindow && [view window] == window && newWindow == nullptr)
         {
@@ -1248,7 +1250,17 @@ public:
             windowObservers.emplace_back (view, dismissModalsSelector, NSWindowWillMiniaturizeNotification, currentWindow);
             windowObservers.emplace_back (view, becomeKeySelector, NSWindowDidBecomeKeyNotification, currentWindow);
             windowObservers.emplace_back (view, resignKeySelector, NSWindowDidResignKeyNotification, currentWindow);
+            windowObservers.emplace_back (view, cancelPressesSelector, NSWindowWillMiniaturizeNotification, currentWindow);
+            windowObservers.emplace_back (view, cancelPressesSelector, NSWindowWillCloseNotification, currentWindow);
         }
+    }
+
+    // AppKit sends a press's mouse-up (mouseUp:, the only release this peer hears but a later mouseMoved:) to the view
+    // its mouse-down hit, and only while that window takes events. A window miniaturised, closed or left, a modal
+    // session or a menu's tracking loop takes the release, so the press ends here as a cancel, never a click.
+    void cancelPresses()
+    {
+        ComponentPeer::cancelPresses (Time::currentTimeMillis());
     }
 
     void dismissModals()
@@ -1266,6 +1278,10 @@ public:
     {
         viewFocusLoss();
         sendModalInputAttemptIfBlocked (KeyWindowChanged::yes);
+
+        // Only a modal session drops the release: a press's mouse-up still reaches a window that just lost key.
+        if (auto* modal = [NSApp modalWindow]; modal != nil && modal != [view window])
+            cancelPresses();
     }
 
     void liveResizingStart()
@@ -1751,6 +1767,7 @@ public:
     static inline const auto asyncMouseUpSelector   = @selector (asyncMouseUp:);
     static inline const auto becomeKeySelector      = @selector (becomeKey:);
     static inline const auto resignKeySelector      = @selector (resignKey:);
+    static inline const auto cancelPressesSelector  = @selector (cancelPresses);
     JUCE_END_IGNORE_WARNINGS_GCC_LIKE
 
    #if JUCE_COREGRAPHICS_RENDER_WITH_MULTIPLE_PAINT_CALLS
@@ -2159,6 +2176,7 @@ struct JuceNSViewClass final : public NSViewComponentPeerWrapper<ObjCClass<NSVie
         addMethod (NSViewComponentPeer::frameChangedSelector,   [] (id self, SEL, NSNotification*)   { callOnOwner (self, &NSViewComponentPeer::redirectMovedOrResized); });
         addMethod (NSViewComponentPeer::becomeKeySelector,      [] (id self, SEL)                    { callOnOwner (self, &NSViewComponentPeer::becomeKey); });
         addMethod (NSViewComponentPeer::resignKeySelector,      [] (id self, SEL)                    { callOnOwner (self, &NSViewComponentPeer::resignKey); });
+        addMethod (NSViewComponentPeer::cancelPressesSelector,  [] (id self, SEL)                    { callOnOwner (self, &NSViewComponentPeer::cancelPresses); });
 
         addMethod (@selector (paste:),                          [] (id self, SEL, NSObject* s)       { callOnOwner (self, &NSViewComponentPeer::redirectPaste,            s);  });
         addMethod (@selector (copy:),                           [] (id self, SEL, NSObject* s)       { callOnOwner (self, &NSViewComponentPeer::redirectCopy,             s);  });
@@ -2233,6 +2251,7 @@ struct JuceNSViewClass final : public NSViewComponentPeerWrapper<ObjCClass<NSVie
 
         addMethod (@selector (windowWillMiniaturize:), [] (id self, SEL, NSNotification*)
         {
+
             if (auto* p = getOwner (self))
             {
                 if (p->isAlwaysOnTop)

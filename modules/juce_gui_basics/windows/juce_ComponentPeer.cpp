@@ -99,6 +99,36 @@ void ComponentPeer::handleMouseEvent (MouseInputSource::InputSourceType type, Po
         MouseInputSource (*mouse).handleEvent (*this, pos, time, newMods, newPressure, newOrientation, pen);
 }
 
+void ComponentPeer::handleMouseCancel (MouseInputSource::InputSourceType type, Point<float> pos, ModifierKeys mods, int64 time, int touchIndex)
+{
+    if (auto* mouse = Desktop::getInstance().mouseSources->getOrCreateMouseInputSource (type, touchIndex))
+    {
+        if (! mouse->isDragging())
+            return;
+
+        const ScopedValueSetter<bool> cancelling (mouse->pimpl->pressCancelled, true);
+        MouseInputSource (*mouse).handleEvent (*this, pos, time, mods.withoutMouseButtons(), MouseInputSource::defaultPressure,
+                                               MouseInputSource::defaultOrientation, {});
+    }
+}
+
+void ComponentPeer::cancelPresses (int64 time)
+{
+    const auto sources = Desktop::getInstance().getMouseSources();
+
+    for (auto& source : sources)
+    {
+        if (! source.isDragging() || source.pimpl->getPeer() != this)
+            continue;
+
+        ModifierKeys::currentModifiers = ModifierKeys::currentModifiers.withoutMouseButtons();
+        handleMouseCancel (source.getType(), globalToLocal (source.getRawScreenPosition()), ModifierKeys::currentModifiers, time, source.getIndex());
+
+        if (! isValidPeer (this))
+            return;
+    }
+}
+
 void ComponentPeer::handleMouseWheel (MouseInputSource::InputSourceType type, Point<float> pos, int64 time, const MouseWheelDetails& wheel, int touchIndex)
 {
     if (auto* mouse = Desktop::getInstance().mouseSources->getOrCreateMouseInputSource (type, touchIndex))

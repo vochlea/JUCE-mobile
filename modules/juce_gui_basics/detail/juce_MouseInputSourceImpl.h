@@ -543,6 +543,7 @@ public:
     ModifierKeys buttonState;
 
     bool isUnboundedMouseModeOn = false, isCursorVisibleUntilOffscreen = false;
+    bool pressCancelled = false; // only while ComponentPeer::handleMouseCancel delivers its mouse-up
 
 private:
     WeakReference<Component> componentUnderMouse, lastNonInertialWheelTarget;
