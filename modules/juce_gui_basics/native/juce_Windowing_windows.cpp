@@ -2828,9 +2828,13 @@ private:
         if (wasDragging)
         {
             if (cancelled)
+            {
                 handleMouseCancel (MouseInputSource::InputSourceType::mouse, position, ModifierKeys::currentModifiers, getMouseEventTime());
+            }
             else
+            {
                 doMouseEvent (position, MouseInputSource::defaultPressure);
+            }
         }
     }
 
@@ -2854,7 +2858,9 @@ private:
     void cancelPointerPress (const WPARAM wParam)
     {
         if (! canUsePointerAPI)
+        {
             return;
+        }
 
         const auto type = getPointerType (wParam);
         auto touchIndex = 0;
@@ -2864,7 +2870,9 @@ private:
             touchIndex = currentTouches.findIndexOfTouch (this, GET_POINTERID_WPARAM (wParam));
 
             if (touchIndex < 0)
+            {
                 return;
+            }
 
             currentTouches.clearTouch (touchIndex);
         }
@@ -2879,24 +2887,32 @@ private:
         for (auto& source : Desktop::getInstance().getMouseSources())
         {
             if (source.getType() != type || source.getIndex() != touchIndex || ! source.isDragging())
+            {
                 continue;
+            }
 
             handleMouseCancel (type, globalToLocal (source.getRawScreenPosition()), ModifierKeys::currentModifiers, time, touchIndex);
 
             if (! isValidPeer (this))
+            {
                 return;
+            }
 
             handleMouseEvent (type, MouseInputSource::offscreenMousePos, ModifierKeys::currentModifiers, MouseInputSource::defaultPressure,
                               MouseInputSource::defaultOrientation, time, {}, touchIndex);
 
             if (! isValidPeer (this))
+            {
                 return;
+            }
 
             break;
         }
 
         if (type == MouseInputSource::InputSourceType::touch && ! currentTouches.areAnyTouchesActive())
+        {
             currentTouches.clear();
+        }
     }
 
     void doMouseExit()

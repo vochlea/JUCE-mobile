@@ -104,7 +104,9 @@ void ComponentPeer::handleMouseCancel (MouseInputSource::InputSourceType type, P
     if (auto* mouse = Desktop::getInstance().mouseSources->getOrCreateMouseInputSource (type, touchIndex))
     {
         if (! mouse->isDragging())
+        {
             return;
+        }
 
         const ScopedValueSetter<bool> cancelling (mouse->pimpl->pressCancelled, true);
         MouseInputSource (*mouse).handleEvent (*this, pos, time, mods.withoutMouseButtons(), MouseInputSource::defaultPressure,
@@ -119,13 +121,17 @@ void ComponentPeer::cancelPresses (int64 time)
     for (auto& source : sources)
     {
         if (! source.isDragging() || source.pimpl->getPeer() != this)
+        {
             continue;
+        }
 
         ModifierKeys::currentModifiers = ModifierKeys::currentModifiers.withoutMouseButtons();
         handleMouseCancel (source.getType(), globalToLocal (source.getRawScreenPosition()), ModifierKeys::currentModifiers, time, source.getIndex());
 
         if (! isValidPeer (this))
+        {
             return;
+        }
     }
 }
 

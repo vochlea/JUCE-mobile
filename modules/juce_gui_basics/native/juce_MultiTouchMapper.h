@@ -65,8 +65,12 @@ public:
     int findIndexOfTouch (ComponentPeer* peer, IDType touchID) const
     {
         for (int i = 0; i < currentTouches.size(); ++i)
+        {
             if (touchID != 0 && currentTouches[i].touchId == touchID && currentTouches[i].owner == peer)
+            {
                 return i;
+            }
+        }
 
         return -1;
     }

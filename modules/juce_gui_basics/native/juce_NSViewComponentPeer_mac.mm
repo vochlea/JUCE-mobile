@@ -1282,12 +1282,16 @@ public:
     {
         // Only a modal session drops the release: a press's mouse-up still reaches a window that just lost key.
         if (auto* modal = [NSApp modalWindow]; modal != nil && modal != [view window])
+        {
             postCancelPresses (view);
+        }
 
         viewFocusLoss();
 
         if (! isValidPeer (this)) // (a focus-loss callback can delete the peer)
+        {
             return;
+        }
 
         sendModalInputAttemptIfBlocked (KeyWindowChanged::yes);
     }
