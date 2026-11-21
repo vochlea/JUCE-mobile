@@ -2849,9 +2849,9 @@ private:
             doMouseUp (getCurrentMousePos(), (WPARAM) 0, false, true);
     }
 
-    // Another window took a pen or touch pointer: no WM_POINTERUP follows, so its press ends here as a cancel, and the
-    // source and touch bookkeeping are cleared, or the source stays dragging and mouse input is ignored after it.
-    void doPointerCaptureChanged (const WPARAM wParam)
+    // Another window took a pen or touch pointer (no WM_POINTERUP follows) or the system cancelled it: its press ends as a
+    // cancel, and the source and touch bookkeeping are cleared, or the source stays dragging and mouse input is ignored.
+    void cancelPointerPress (const WPARAM wParam)
     {
         if (! canUsePointerAPI)
             return;
@@ -3086,6 +3086,12 @@ private:
     {
         if (! canUsePointerAPI)
             return false;
+
+        if (isUp && (HIWORD (wParam) & POINTER_FLAG_CANCELED) != 0)
+        {
+            cancelPointerPress (wParam);
+            return true;
+        }
 
         auto pointerType = getPointerType (wParam);
 
@@ -4016,7 +4022,7 @@ private:
                 break;
 
             case WM_POINTERCAPTURECHANGED:
-                doPointerCaptureChanged (wParam);
+                cancelPointerPress (wParam);
                 return 0;
 
             //==============================================================================
